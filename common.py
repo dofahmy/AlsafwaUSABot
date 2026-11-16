@@ -1,6 +1,6 @@
 import os
 from datetime import datetime, timedelta, timezone
-from sqlalchemy import create_engine, Column, Integer, BigInteger, String, DateTime, Text, Boolean, UniqueConstraint
+from sqlalchemy import create_engine, Column, Integer, BigInteger, String, DateTime, Text, Boolean, UniqueConstraint, select
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 DATABASE_URL = os.getenv('DATABASE_URL', 'sqlite:///./rajih_customers.db')
@@ -49,6 +49,17 @@ class Delivery(Base):
     sent_at=Column(DateTime(timezone=True))
     error=Column(Text)
 
+class HistoricalDelivery(Base):
+    """Durable, per-customer queue for already-closed recommendations sent after activation."""
+    __tablename__='historical_deliveries'
+    __table_args__=(UniqueConstraint('telegram_id','signal_id',name='uq_historical_customer_signal'),)
+    id=Column(Integer,primary_key=True,autoincrement=True)
+    telegram_id=Column(BigInteger,nullable=False,index=True)
+    signal_id=Column(String(120),nullable=False)
+    payload=Column(Text,nullable=False)
+    status=Column(String(20),default='queued',nullable=False)
+    sent_at=Column(DateTime(timezone=True))
+
 class Payment(Base):
     __tablename__='external_payments'
     id=Column(Integer,primary_key=True)
@@ -74,3 +85,44 @@ def grant(db, customer, days, kind):
     if kind=='trial': customer.trial_used=True
     db.add(customer)
     return customer.access_until
+
+
+CLOSED_KINDS=('target2','stop','eod')
+
+def queue_recent_closed(db, telegram_id, limit=5):
+    """Queue most recent distinct *closed* recommendations, never as live alerts.
+
+    Historical recommendations are delivered once per customer/signal even after renewal.
+    If there is no closed event stored yet, return 0 (no fabricated history).
+    """
+    endings=db.scalars(select(Event).where(Event.kind.in_(CLOSED_KINDS))
+                       .order_by(Event.id.desc())).all()
+    added=0
+    seen=set()
+    for end in endings:
+        sid=end.signal_id
+        if sid in seen: continue
+        seen.add(sid)
+        exists=db.scalar(select(HistoricalDelivery.id).where(
+            HistoricalDelivery.telegram_id==telegram_id,
+            HistoricalDelivery.signal_id==sid))
+        if exists:continue
+        opening=db.scalar(select(Event).where(Event.signal_id==sid,Event.kind=='open')
+                          .order_by(Event.id.asc()).limit(1))
+        parts=['📚 توصية مغلقة سابقة — للعرض فقط',
+               '⚠️ ليست إشارة دخول جديدة',
+               f'السهم: {end.symbol}',
+               f'معرّف التوصية: {sid}']
+        if opening:parts.extend(['', '📈 إشارة الدخول الأصلية:', opening.payload])
+        parts.extend(['', '🏁 آخر تحديث لإغلاق التوصية:', end.payload])
+        content='\n'.join(parts)
+        if len(content)>3900:
+            # Telegram max 4096; retain both the original signal and final status.
+            header='\n'.join(parts[:4])
+            entry=(opening.payload[:1400] if opening else 'غير محفوظة')
+            final=end.payload[:1400]
+            content=f'{header}\n\n📈 إشارة الدخول الأصلية:\n{entry}\n\n🏁 آخر تحديث للإغلاق:\n{final}'
+        db.add(HistoricalDelivery(telegram_id=telegram_id,signal_id=sid,payload=content))
+        added+=1
+        if added>=limit:break
+    return added

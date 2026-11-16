@@ -5,7 +5,7 @@ import os, json, hmac
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import select
-from common import Session, Customer, Event, Delivery, Payment, grant, active, utcnow
+from common import Session, Customer, Event, Delivery, Payment, queue_recent_closed, grant, active, utcnow
 from telegram_api import send
 
 app=FastAPI(title='Rajih Customer API',docs_url=None,redoc_url=None)
@@ -61,6 +61,7 @@ def confirmed_payment(x:ExternalConfirmation,x_payment_bridge_key:str|None=Heade
         db.add(Payment(provider=x.provider,provider_payment_id=x.provider_payment_id,
                        telegram_id=x.telegram_id,period_days=x.period_days))
         until=grant(db,customer,x.period_days,'subscription')
+        queue_recent_closed(db,x.telegram_id,int(os.getenv('HISTORY_ON_ACTIVATION_COUNT','5')))
         for req in db.scalars(select(__import__('common').Request).where(__import__('common').Request.telegram_id==x.telegram_id,
                                                 __import__('common').Request.kind=='subscription',
                                                 __import__('common').Request.status=='pending')).all():

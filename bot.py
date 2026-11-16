@@ -2,7 +2,7 @@
 import os, time, json, logging
 from datetime import datetime, timezone
 from sqlalchemy import select
-from common import Session, Customer, Request, Event, Delivery, grant, active, utcnow
+from common import Session, Customer, Request, Event, Delivery, HistoricalDelivery, queue_recent_closed, grant, active, utcnow
 from telegram_api import call,send
 LOG=logging.getLogger('rajih.bot')
 logging.basicConfig(level=logging.INFO)
@@ -64,6 +64,7 @@ def decide(actor,action,rid):
             # Subscription approval is a manual administrative attestation of external payment.
             until=grant(db,c,TRIAL_DAYS if req.kind=='trial' else PERIOD_DAYS,req.kind)
             req.status='approved'
+            queued_history=queue_recent_closed(db,req.telegram_id,int(os.getenv('HISTORY_ON_ACTIVATION_COUNT','5')))
             notice=f'✅ تم تفعيل {"التجربة" if req.kind=="trial" else "الاشتراك"} حتى {until:%Y-%m-%d} UTC.'
         else:
             req.status='rejected';notice='تمت مراجعة طلب التفعيل، ولم تتم الموافقة عليه.'
@@ -97,6 +98,30 @@ def process(update):
         uid=msg['from']['id'];ensure_user(uid,msg['from'].get('username',''))
         send(uid,'أهلًا بيكي في راجح 👑\nمفيش شراء أو دفع داخل تليجرام. هنا بتقدمي طلب تفعيل وبتتابعي توصياتك.',MAIN_MENU)
 
+def deliver_historical():
+    """Send queued onboarding history to active accounts, with no new-trade implication."""
+    with Session() as db:
+        ids=list(db.scalars(select(HistoricalDelivery.id).where(
+            HistoricalDelivery.status=='queued').order_by(HistoricalDelivery.id).limit(25)).all())
+    for hid in ids:
+        with Session() as db:
+            h=db.get(HistoricalDelivery,hid)
+            c=db.get(Customer,h.telegram_id)
+            if not active(c):
+                continue  # Keep queued until account is active.
+            target=h.telegram_id
+            body=h.payload
+        try:
+            send(target,body)
+            with Session.begin() as db:
+                row=db.get(HistoricalDelivery,hid)
+                row.status='sent'
+                row.sent_at=utcnow()
+            time.sleep(.07)
+        except Exception as exc:
+            LOG.warning('historical deliver %s failed: %s',hid,str(exc)[:100])
+            break
+
 def deliver():
     with Session() as db:
         ids=list(db.scalars(select(Delivery.id).where(Delivery.status=='queued').order_by(Delivery.id).limit(35)).all())
@@ -124,6 +149,7 @@ def main():
     offset=None
     while True:
         try:
+            deliver_historical()
             deliver()
             updates=call('getUpdates',{'offset':offset,'timeout':10,'allowed_updates':['message','callback_query']},timeout=20)
             for u in updates:
