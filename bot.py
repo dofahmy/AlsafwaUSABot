@@ -188,12 +188,15 @@ def ask_days(actor,rid):
         req=db.get(Request,rid)
         if not req or req.status!='pending':return 'الطلب تمت معالجته أو غير موجود.'
         tid=req.telegram_id
+        cur=db.get(Customer,tid)
+        cur_line=(f'\nاشتراكه الحالي شغال لحد {cur.access_until.astimezone(NY):%d/%m/%Y}، والمدة الجديدة هتبدأ من النهارده.'
+                  if active(cur) else '')
     who,_=_who(tid)
     rows=[]
     for i in range(0,len(DAY_CHOICES),4):
         rows.append([{'text':_days(d),'callback_data':f'grant:{rid}:{d}'} for d in DAY_CHOICES[i:i+4]])
     rows.append([{'text':'❌ إلغاء','callback_data':'noop'}])
-    return (f'⏳ تفعيل اشتراك الطلب #{rid}\nالعميل: {who} (ID: {tid})\n\nاختار مدة الاشتراك.\n'
+    return (f'⏳ تفعيل اشتراك الطلب #{rid}\nالعميل: {who} (ID: {tid}){cur_line}\n\nاختار مدة الاشتراك (من النهارده).\n'
             f'أو لعدد أيام تاني ابعت: /sub {rid} عدد_الأيام\nمثال: /sub {rid} 45'),rows
 
 
@@ -208,7 +211,9 @@ def decide(actor,action,rid,days=None):
         if action=='approve':
             if req.kind=='trial' and (c.trial_used or active(c)):return 'التجربة غير متاحة لهذا الحساب.'
             # Subscription approval is a manual administrative attestation of external payment.
-            until=grant(db,c,days,req.kind)
+            # المدة بتبدأ من النهارده (مش بتتضاف على تجربة أو اشتراك قديم)
+            c.access_until=utcnow()+timedelta(days=days);c.status='active';db.add(c)
+            until=c.access_until
             req.status='approved'
             queued_history=queue_recent_closed(db,req.telegram_id,int(os.getenv('HISTORY_ON_ACTIVATION_COUNT','5')))
             end_ny=until.astimezone(NY)
@@ -260,6 +265,19 @@ def process(update):
             if len(p)!=3 or not p[1].isdigit() or not p[2].isdigit() or int(p[2])<1:
                 send(uid,'الصيغة: /sub <رقم الطلب> <عدد الأيام>\nمثال: /sub 12 45');return
             send(uid,decide(uid,'approve',int(p[1]),int(p[2])) );return
+        # الإدارة: /set <ID العميل> <عدد الأيام> ← تظبيط اشتراك عميل من النهارده (0 = إيقاف)
+        if uid in ADMINS and text.startswith('/set'):
+            p=text.split()
+            if len(p)!=3 or not p[1].isdigit() or not p[2].isdigit():
+                send(uid,'الصيغة: /set <ID العميل> <عدد الأيام>\nمثال: /set 123456789 7\n(0 = إيقاف الاشتراك)');return
+            n=int(p[2])
+            with Session.begin() as db:
+                c=db.get(Customer,int(p[1]))
+                if not c:send(uid,'العميل ده مش موجود في البوت.');return
+                c.access_until=utcnow()+timedelta(days=n) if n else utcnow()-timedelta(seconds=1)
+                c.status='active' if n else 'inactive';db.add(c);until=c.access_until
+            send(uid,f'✅ اشتراك العميل {p[1]} بقى لحد {until.astimezone(NY):%d/%m/%Y}.' if n else f'⛔ اشتراك العميل {p[1]} اتوقف.')
+            return
         if text=='/myid':
             send(uid,f'الـ ID بتاعك: {uid}');return
         # الإدارة: /r <ID> <الرسالة> ← رد على عميل من البوت
