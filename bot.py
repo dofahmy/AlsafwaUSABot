@@ -39,7 +39,8 @@ def trial_until(now_utc=None,sessions=None):
 
 PERIOD_DAYS=int(os.getenv('MANUAL_SUBSCRIPTION_DAYS','30'))
 MAIN_MENU=[[{'text':'🎁 تجربة مجانية (جلستين تداول)','callback_data':'request:trial'}, {'text':'💳 الاشتراك الآن','callback_data':'request:subscription'}],
-           [{'text':'📈 توصياتي','callback_data':'mine'}, {'text':'👤 حسابي','callback_data':'account'}]]
+           [{'text':'📈 توصياتي','callback_data':'mine'}, {'text':'👤 حسابي','callback_data':'account'}],
+           [{'text':'📊 أداء الشهر الماضي','callback_data':'perf'}]]
 
 def ensure_user(tid,username=''):
     with Session.begin() as db:
@@ -77,6 +78,96 @@ def _pct(text):
     if not m:return None
     try:return float(m[-1].replace('−','-'))
     except ValueError:return None
+
+
+def _count(n,one,many):
+    if n==1:return f'{one} واحدة'
+    if n==2:return {'توصية':'توصيتان','جلسة':'جلستان'}.get(one,f'2 {one}')
+    return f'{n} {many if 3<=n<=10 else one}'
+
+
+def _fmt_day(d):
+    return d.strftime('%d/%m')
+
+
+def performance(days=30):
+    """أداء التوصيات آخر 30 يومًا من قاعدة بيانات البوت (متاح لأي حد يفتح البوت)."""
+    from collections import defaultdict
+    today=utcnow().astimezone(NY).date()
+    start=today-timedelta(days=days)
+    with Session() as db:
+        evs=db.scalars(select(Event).order_by(Event.id)).all()
+    sig=defaultdict(list)
+    for e in evs:
+        try:d=datetime.strptime(e.signal_id.split(':')[0],'%Y-%m-%d').date()
+        except Exception:continue
+        if start<=d<=today:sig[e.signal_id].append(e)
+    rows=[]
+    for sid,es in sig.items():
+        kinds={e.kind for e in es}
+        opened=next((e for e in es if e.kind=='open'),None)
+        if not opened:continue
+        d=datetime.strptime(sid.split(':')[0],'%Y-%m-%d').date()
+        if 'cancelled' in kinds:res='cancelled'
+        elif 'target2' in kinds:res='target2'
+        elif 'target1' in kinds:res='target1'
+        elif 'stop' in kinds:res='stop'
+        elif 'eod' in kinds:res='eod'
+        elif '⏳' in (opened.payload or '') and 'activated' not in kinds:res='pending'
+        else:res='open'
+        last=[e for e in es if e.kind in ('target1','target2','stop','eod')]
+        pct=_pct(last[-1].payload) if last else None
+        rows.append({'d':d,'sym':es[0].symbol,'res':res,'pct':pct})
+    if not rows:
+        return 'لا توجد توصيات خلال آخر 30 يومًا بعد.'
+    act=[r for r in rows if r['res'] not in ('cancelled','pending')]
+    canc=sum(r['res']=='cancelled' for r in rows)
+    wins=[r for r in act if r['res'] in ('target1','target2')]
+    stops=[r for r in act if r['res']=='stop']
+    dec=len(wins)+len(stops)
+    rets=[r for r in act if r['pct'] is not None]
+    sessions=len({r['d'] for r in rows})
+    out=[f'📊 أداء توصيات الصفوة — آخر {days} يومًا',
+         f'من {start:%d/%m/%Y} إلى {today:%d/%m/%Y}','',
+         '📌 ملخص',
+         f"• عدد التوصيات: {_count(len(rows),'توصية','توصيات')} خلال {_count(sessions,'جلسة','جلسات')} تداول",
+         f'• تم تفعيلها: {len(act)} — ملغية لعدم التفعيل: {canc}']
+    if dec:out.append(f'• نسبة النجاح: {len(wins)/dec:.0%} ({len(wins)} من {dec})')
+    out+=['','🎯 النتائج',
+          f"• حققت الهدف الثاني: {sum(r['res']=='target2' for r in act)}",
+          f"• حققت الهدف الأول: {sum(r['res']=='target1' for r in act)}",
+          f'• ضربت وقف الخسارة: {len(stops)}',
+          f"• أُغلقت نهاية اليوم دون هدف أو وقف: {sum(r['res']=='eod' for r in act)}"]
+    still=sum(r['res'] in ('open','pending') for r in rows)
+    if still:out.append(f'• ما زالت مفتوحة: {still}')
+    if rets:
+        best=max(rets,key=lambda r:r['pct']);worst=min(rets,key=lambda r:r['pct'])
+        out+=['','💵 العائد',
+              f"• متوسط عائد التوصية: {sum(r['pct'] for r in rets)/len(rets):+.1f}%",
+              f"• أفضل توصية: {best['sym']} \u200e{best['pct']:+.1f}%"]
+        if worst['pct']<0:out.append(f"• أكبر خسارة: {worst['sym']} \u200e{worst['pct']:+.1f}%")
+    weeks=[]
+    ws=start
+    while ws<=today:
+        we=min(ws+timedelta(days=6),today)
+        wr=[r for r in act if ws<=r['d']<=we]
+        if wr:
+            w_w=sum(r['res'] in ('target1','target2') for r in wr);w_l=sum(r['res']=='stop' for r in wr)
+            line=f"• {_fmt_day(ws)} – {_fmt_day(we)}: {_count(len(wr),'توصية','توصيات')}"
+            if w_w+w_l:line+=f' — نجاح {w_w/(w_w+w_l):.0%}'
+            weeks.append(line)
+        ws=we+timedelta(days=1)
+    if weeks:out+=['','📅 الأسابيع']+weeks
+    byday=defaultdict(list)
+    for r in act:byday[r['d']].append(r)
+    cand=[(sum(x['res'] in ('target1','target2') for x in v),sum(x['res'] in ('target1','target2','stop') for x in v),d)
+          for d,v in byday.items()]
+    cand=[c for c in cand if c[1]]
+    if cand:
+        w_,n_,d_=max(cand,key=lambda c:(c[0],c[0]/c[1]))
+        out+=['',f'🏆 أفضل يوم: {_fmt_day(d_)} — {w_} من {n_} حققت الهدف']
+    out+=['','⚠️ الأداء السابق لا يضمن النتائج المستقبلية.']
+    return '\n'.join(out)
 
 
 def mine(tid):
@@ -247,6 +338,7 @@ def interact(uid,username,data):
     if data=='request:trial':return submit_request(uid,'trial')
     if data=='request:subscription':return submit_request(uid,'subscription')
     if data=='mine':return mine(uid)
+    if data=='perf':return performance()
     if data=='account':return account(uid)
     return 'اختر من القائمة.'
 
