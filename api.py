@@ -17,7 +17,7 @@ class Incoming(BaseModel):
     event_key:str=Field(min_length=1,max_length=200)
     signal_id:str=Field(min_length=1,max_length=120)
     symbol:str=Field(min_length=1,max_length=32)
-    kind:str=Field(pattern='^(open|target1|target2|stop|eod)$')
+    kind:str=Field(pattern='^(open|target1|target2|stop|eod|notice)$')
     message:str=Field(min_length=1,max_length=3000)
 
 @app.get('/health')
