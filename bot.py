@@ -40,7 +40,7 @@ def trial_until(now_utc=None,sessions=None):
 PERIOD_DAYS=int(os.getenv('MANUAL_SUBSCRIPTION_DAYS','30'))
 MAIN_MENU=[[{'text':'🎁 تجربة مجانية (جلستين تداول)','callback_data':'request:trial'}, {'text':'💳 الاشتراك الآن','callback_data':'request:subscription'}],
            [{'text':'📈 توصياتي','callback_data':'mine'}, {'text':'👤 حسابي','callback_data':'account'}],
-           [{'text':'☀️ نظرة قبل الافتتاح','callback_data':'pre'}, {'text':'📊 أداء الشهر الماضي','callback_data':'perf'}]]
+           [{'text':'☀️ نظرة قبل الافتتاح','callback_data':'pre'}, {'text':'📊 أداء آخر جلستين تداول','callback_data':'perf'}]]
 
 def ensure_user(tid,username=''):
     with Session.begin() as db:
@@ -80,9 +80,27 @@ def _pct(text):
     except ValueError:return None
 
 
+def _num(pattern,text):
+    import re
+    m=re.search(pattern,text or '')
+    try:return float(m.group(1)) if m else None
+    except ValueError:return None
+
+
+def _pct_from_levels(open_text,ev):
+    """لو رسالة الحدث مافيهاش نسبة (من نسخة قديمة للماسح): نحسبها من أسعار رسالة التوصية."""
+    entry=_num(r'سعر (?:الدخول|الشراء):\s*([0-9.]+)',open_text)
+    if not entry:return None
+    if ev.kind=='target1':p=_num(r'الهدف الأول:\s*([0-9.]+)',open_text)
+    elif ev.kind=='target2':p=_num(r'الهدف الثاني:\s*([0-9.]+)',open_text)
+    elif ev.kind=='stop':p=_num(r'وقف الخسارة:\s*([0-9.]+)',open_text)
+    else:p=_num(r'آخر سعر\s*([0-9.]+)',ev.payload)
+    return round((p/entry-1)*100,2) if p else None
+
+
 def _count(n,one,many):
     if n==1:return f'{one} واحدة'
-    if n==2:return {'توصية':'توصيتان','جلسة':'جلستان'}.get(one,f'2 {one}')
+    if n==2:return {'توصية':'توصيتان','جلسة':'جلستين'}.get(one,f'2 {one}')
     return f'{n} {many if 3<=n<=10 else one}'
 
 
@@ -90,18 +108,21 @@ def _fmt_day(d):
     return d.strftime('%d/%m')
 
 
-def performance(days=30):
-    """أداء التوصيات آخر 30 يومًا من قاعدة بيانات البوت (متاح لأي حد يفتح البوت)."""
+def performance(sessions=2):
+    """أداء توصيات آخر جلستين تداول خلصوا (متاح لأي حد يفتح البوت).
+    جلسة النهارده بتدخل بس بعد ما التداول بعد الإغلاق يخلص (٨ مساءً بتوقيت نيويورك)."""
     from collections import defaultdict
-    today=utcnow().astimezone(NY).date()
-    start=today-timedelta(days=days)
+    now=utcnow().astimezone(NY)
+    today=now.date()
     with Session() as db:
         evs=db.scalars(select(Event).order_by(Event.id)).all()
     sig=defaultdict(list)
     for e in evs:
         try:d=datetime.strptime(e.signal_id.split(':')[0],'%Y-%m-%d').date()
         except Exception:continue
-        if start<=d<=today:sig[e.signal_id].append(e)
+        if d<today or (d==today and now.hour>=20):sig[e.signal_id].append(e)
+    keep=sorted({datetime.strptime(k.split(':')[0],'%Y-%m-%d').date() for k in sig})[-sessions:]
+    sig={k:v for k,v in sig.items() if datetime.strptime(k.split(':')[0],'%Y-%m-%d').date() in keep}
     rows=[]
     for sid,es in sig.items():
         kinds={e.kind for e in es}
@@ -117,20 +138,24 @@ def performance(days=30):
         else:res='open'
         last=[e for e in es if e.kind in ('target1','target2','stop','eod')]
         pct=_pct(last[-1].payload) if last else None
+        if last and pct is None:pct=_pct_from_levels(opened.payload,last[-1])
         rows.append({'d':d,'sym':es[0].symbol,'res':res,'pct':pct})
     if not rows:
-        return 'لا توجد توصيات خلال آخر 30 يومًا بعد.'
+        return 'لا توجد توصيات منتهية بعد.'
     act=[r for r in rows if r['res'] not in ('cancelled','pending')]
     canc=sum(r['res']=='cancelled' for r in rows)
     wins=[r for r in act if r['res'] in ('target1','target2')]
     stops=[r for r in act if r['res']=='stop']
     dec=len(wins)+len(stops)
     rets=[r for r in act if r['pct'] is not None]
-    sessions=len({r['d'] for r in rows})
-    out=[f'📊 أداء توصيات الصفوة — آخر {days} يومًا',
-         f'من {start:%d/%m/%Y} إلى {today:%d/%m/%Y}','',
+    ds=sorted({r['d'] for r in rows})
+    period=(f'جلسة {ds[0]:%d/%m/%Y}' if len(ds)==1 else
+            f'جلسة {ds[0]:%d/%m/%Y} وجلسة {ds[1]:%d/%m/%Y}' if len(ds)==2 else
+            f'من {ds[0]:%d/%m/%Y} إلى {ds[-1]:%d/%m/%Y}')
+    out=['📊 أداء توصيات الصفوة — آخر جلستين تداول',
+         period,'',
          '📌 ملخص',
-         f"• عدد التوصيات: {_count(len(rows),'توصية','توصيات')} خلال {_count(sessions,'جلسة','جلسات')} تداول",
+         f"• عدد التوصيات: {_count(len(rows),'توصية','توصيات')}",
          f'• تم تفعيلها: {len(act)} — ملغية لعدم التفعيل: {canc}']
     out+=['','🎯 النتائج',
           f"• حققت الهدف الأول: {sum(r['res'] in ('target1','target2') for r in act)}",
