@@ -40,7 +40,19 @@ def trial_until(now_utc=None,sessions=None):
 PERIOD_DAYS=int(os.getenv('MANUAL_SUBSCRIPTION_DAYS','30'))
 MAIN_MENU=[[{'text':'🎁 تجربة مجانية (جلستين تداول)','callback_data':'request:trial'}, {'text':'💳 الاشتراك الآن','callback_data':'request:subscription'}],
            [{'text':'📈 توصياتي','callback_data':'mine'}, {'text':'👤 حسابي','callback_data':'account'}],
-           [{'text':'☀️ نظرة قبل الافتتاح','callback_data':'pre'}, {'text':'📊 أداء آخر جلستين تداول','callback_data':'perf'}]]
+           [{'text':'☀️ نظرة قبل الافتتاح','callback_data':'pre'}, {'text':'🎧 خدمة العملاء','callback_data':'contact'}]]
+
+# قائمة الأوامر (زرار Menu جنب خانة الكتابة) — بتتسجل في تيليجرام أول ما البوت يشتغل
+BOT_COMMANDS=[
+    {'command':'start','description':'بدء الاستخدام'},
+    {'command':'trial','description':'تفعيل التجربة المجانية'},
+    {'command':'subscribe','description':'الاشتراك الآن'},
+    {'command':'mine','description':'توصياتي'},
+    {'command':'account','description':'بيانات اشتراكي'},
+    {'command':'premarket','description':'نظرة قبل الافتتاح'},
+    {'command':'contact','description':'خدمة العملاء'},
+]
+SUPPORT_USERNAME=os.getenv('SUPPORT_USERNAME','').lstrip('@')   # يوزر حساب خدمة العملاء (اختياري)
 
 def ensure_user(tid,username=''):
     with Session.begin() as db:
@@ -108,78 +120,11 @@ def _fmt_day(d):
     return d.strftime('%d/%m')
 
 
-def performance(sessions=2):
-    """أداء توصيات آخر جلستين تداول خلصوا (متاح لأي حد يفتح البوت).
-    جلسة النهارده بتدخل بس بعد ما التداول بعد الإغلاق يخلص (٨ مساءً بتوقيت نيويورك)."""
-    from collections import defaultdict
-    now=utcnow().astimezone(NY)
-    today=now.date()
-    with Session() as db:
-        evs=db.scalars(select(Event).order_by(Event.id)).all()
-    sig=defaultdict(list)
-    for e in evs:
-        try:d=datetime.strptime(e.signal_id.split(':')[0],'%Y-%m-%d').date()
-        except Exception:continue
-        if d<today or (d==today and now.hour>=20):sig[e.signal_id].append(e)
-    keep=sorted({datetime.strptime(k.split(':')[0],'%Y-%m-%d').date() for k in sig})[-sessions:]
-    sig={k:v for k,v in sig.items() if datetime.strptime(k.split(':')[0],'%Y-%m-%d').date() in keep}
-    rows=[]
-    for sid,es in sig.items():
-        kinds={e.kind for e in es}
-        opened=next((e for e in es if e.kind=='open'),None)
-        if not opened:continue
-        d=datetime.strptime(sid.split(':')[0],'%Y-%m-%d').date()
-        if 'cancelled' in kinds:res='cancelled'
-        elif 'target2' in kinds:res='target2'
-        elif 'target1' in kinds:res='target1'
-        elif 'stop' in kinds:res='stop'
-        elif 'eod' in kinds:res='eod'
-        elif '⏳' in (opened.payload or '') and 'activated' not in kinds:res='pending'
-        else:res='open'
-        last=[e for e in es if e.kind in ('target1','target2','stop','eod')]
-        pct=_pct(last[-1].payload) if last else None
-        if last and pct is None:pct=_pct_from_levels(opened.payload,last[-1])
-        rows.append({'d':d,'sym':es[0].symbol,'res':res,'pct':pct})
-    if not rows:
-        return 'لا توجد توصيات منتهية بعد.'
-    act=[r for r in rows if r['res'] not in ('cancelled','pending')]
-    canc=sum(r['res']=='cancelled' for r in rows)
-    wins=[r for r in act if r['res'] in ('target1','target2')]
-    stops=[r for r in act if r['res']=='stop']
-    dec=len(wins)+len(stops)
-    rets=[r for r in act if r['pct'] is not None]
-    ds=sorted({r['d'] for r in rows})
-    period=(f'جلسة {ds[0]:%d/%m/%Y}' if len(ds)==1 else
-            f'جلسة {ds[0]:%d/%m/%Y} وجلسة {ds[1]:%d/%m/%Y}' if len(ds)==2 else
-            f'من {ds[0]:%d/%m/%Y} إلى {ds[-1]:%d/%m/%Y}')
-    out=['📊 أداء توصيات الصفوة — آخر جلستين تداول',
-         period,'',
-         '📌 ملخص',
-         f"• عدد التوصيات: {_count(len(rows),'توصية','توصيات')}",
-         f'• تم تفعيلها: {len(act)} — ملغية لعدم التفعيل: {canc}']
-    out+=['','🎯 النتائج',
-          f"• حققت الهدف الأول: {sum(r['res'] in ('target1','target2') for r in act)}",
-          f"• حققت الهدف الثاني: {sum(r['res']=='target2' for r in act)}",
-          f'• ضربت وقف الخسارة: {len(stops)}',
-          f"• أُغلقت نهاية اليوم دون هدف أو وقف: {sum(r['res']=='eod' for r in act)}"]
-    still=sum(r['res'] in ('open','pending') for r in rows)
-    if still:out.append(f'• ما زالت مفتوحة: {still}')
-    if rets:
-        best=max(rets,key=lambda r:r['pct']);worst=min(rets,key=lambda r:r['pct'])
-        out+=['','💵 العائد',
-              f"• متوسط عائد التوصية: {sum(r['pct'] for r in rets)/len(rets):+.1f}%",
-              f"• أفضل توصية: {best['sym']} \u200e{best['pct']:+.1f}%"]
-        if worst['pct']<0:out.append(f"• أكبر خسارة: {worst['sym']} \u200e{worst['pct']:+.1f}%")
-    byday=defaultdict(list)
-    for r in act:byday[r['d']].append(r)
-    cand=[(sum(x['res'] in ('target1','target2') for x in v),sum(x['res'] in ('target1','target2','stop') for x in v),d)
-          for d,v in byday.items()]
-    cand=[c for c in cand if c[1]]
-    if cand:
-        w_,n_,d_=max(cand,key=lambda c:(c[0],c[0]/c[1]))
-        out+=['',f'🏆 أفضل يوم: {_fmt_day(d_)} — {w_} من {n_} حققت الهدف']
-    out+=['','⚠️ الأداء السابق لا يضمن النتائج المستقبلية.']
-    return '\n'.join(out)
+def contact(uid):
+    """خدمة العملاء: أي رسالة يكتبها العميل في البوت بتتحول للإدارة، أو يكلم حساب الدعم مباشرة."""
+    kb=[[{'text':'💬 مراسلة خدمة العملاء','url':f'https://t.me/{SUPPORT_USERNAME}'}]] if SUPPORT_USERNAME else []
+    send(uid,'🎧 خدمة العملاء\nاكتب رسالتك هنا مباشرة وسيتم تحويلها إلى فريق الصفوة، وسنرد عليك في أقرب وقت.'
+         +('\nأو راسلنا مباشرة من الزر بالأسفل.' if SUPPORT_USERNAME else ''),kb+MAIN_MENU)
 
 
 def send_premarket(uid):
@@ -222,7 +167,7 @@ def mine(tid):
             line=f'🔷 {last.symbol}\n{label}\n🗓️ {day}'
             if hhmm:line+=f' الساعة {hhmm} بتوقيت نيويورك'
             if price:line+=f' — سعر الشراء {price}'
-            pct=_pct(last.payload) if last.kind!='open' else None
+            pct=(_pct(last.payload) or _pct_from_levels(opened.payload if opened else '',last)) if last.kind in ('target1','target2','stop','eod') else None
             if pct is not None:
                 line+=f'\n💵 العائد: {pct:+.2f}%'
                 rets.append(pct)
@@ -364,17 +309,17 @@ def interact(uid,username,data):
     if data=='request:trial':return submit_request(uid,'trial')
     if data=='request:subscription':return submit_request(uid,'subscription')
     if data=='mine':return mine(uid)
-    if data=='perf':return performance()
+    if data=='perf':return 'تم إلغاء هذه الخدمة.'
     if data=='account':return account(uid)
     return 'اختر من القائمة.'
 
 def process(update):
     msg=update.get('message')
     cb=update.get('callback_query')
-    if cb and cb.get('data')=='pre':
+    if cb and cb.get('data') in ('pre','contact'):
         uid=cb['from']['id'];ensure_user(uid,cb['from'].get('username',''))
         call('answerCallbackQuery',{'callback_query_id':cb['id']})
-        send_premarket(uid)
+        (send_premarket if cb['data']=='pre' else contact)(uid)
         return
     if cb:
         uid=cb['from']['id'];username=cb['from'].get('username','')
@@ -387,6 +332,14 @@ def process(update):
     if msg and msg['chat']['type']=='private':
         uid=msg['from']['id'];ensure_user(uid,msg['from'].get('username',''))
         text=(msg.get('text') or '').strip()
+        cmd=text.split()[0].split('@')[0].lower() if text.startswith('/') else ''
+        # أوامر القائمة
+        if cmd in ('/trial','/subscribe','/mine','/account'):
+            r={'/trial':lambda:auto_trial(uid),'/subscribe':lambda:subscribe_now(uid),
+               '/mine':lambda:mine(uid),'/account':lambda:account(uid)}[cmd]()
+            send(uid,r,MAIN_MENU);return
+        if cmd=='/premarket':send_premarket(uid);return
+        if cmd=='/contact':contact(uid);return
         # الإدارة: /sub <رقم الطلب> <عدد الأيام> ← تفعيل اشتراك بعدد أيام مخصص
         if uid in ADMINS and text.startswith('/sub'):
             p=text.split()
@@ -472,6 +425,10 @@ def deliver():
 def main():
     if not os.getenv('CUSTOMER_BOT_TOKEN'):raise RuntimeError('Set CUSTOMER_BOT_TOKEN')
     call('deleteWebhook',{'drop_pending_updates':False})
+    try:
+        call('setMyCommands',{'commands':BOT_COMMANDS})
+        call('setChatMenuButton',{'menu_button':{'type':'commands'}})
+    except Exception:LOG.exception('Cannot set bot commands')
     offset=None
     while True:
         try:
