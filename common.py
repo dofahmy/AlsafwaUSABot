@@ -69,6 +69,15 @@ class Payment(Base):
     period_days=Column(Integer,nullable=False)
     confirmed_at=Column(DateTime(timezone=True),default=utcnow)
 
+class PremarketPost(Base):
+    """صورة «نظرة قبل الافتتاح» وتعليقها (آخر كام يوم بس)."""
+    __tablename__='premarket_posts'
+    id=Column(Integer,primary_key=True,autoincrement=True)
+    day=Column(String(10),nullable=False,index=True)
+    caption=Column(Text,nullable=False)
+    image_b64=Column(Text,nullable=False)
+    created_at=Column(DateTime(timezone=True),default=utcnow)
+
 Base.metadata.create_all(engine)
 
 def active(customer):

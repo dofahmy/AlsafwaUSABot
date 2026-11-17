@@ -2,8 +2,8 @@
 import os, time, json, logging
 from datetime import datetime, timezone
 from sqlalchemy import select
-from common import Session, Customer, Request, Event, Delivery, HistoricalDelivery, queue_recent_closed, grant, active, utcnow
-from telegram_api import call,send
+from common import Session, Customer, Request, Event, Delivery, HistoricalDelivery, PremarketPost, queue_recent_closed, grant, active, utcnow
+from telegram_api import call,send,send_photo
 LOG=logging.getLogger('rajih.bot')
 logging.basicConfig(level=logging.INFO)
 ADMINS={int(s) for s in os.getenv('ADMIN_TELEGRAM_IDS','').replace(' ','').split(',') if s.isdigit()}
@@ -40,7 +40,7 @@ def trial_until(now_utc=None,sessions=None):
 PERIOD_DAYS=int(os.getenv('MANUAL_SUBSCRIPTION_DAYS','30'))
 MAIN_MENU=[[{'text':'🎁 تجربة مجانية (جلستين تداول)','callback_data':'request:trial'}, {'text':'💳 الاشتراك الآن','callback_data':'request:subscription'}],
            [{'text':'📈 توصياتي','callback_data':'mine'}, {'text':'👤 حسابي','callback_data':'account'}],
-           [{'text':'📊 أداء الشهر الماضي','callback_data':'perf'}]]
+           [{'text':'☀️ نظرة قبل الافتتاح','callback_data':'pre'}, {'text':'📊 أداء الشهر الماضي','callback_data':'perf'}]]
 
 def ensure_user(tid,username=''):
     with Session.begin() as db:
@@ -155,6 +155,20 @@ def performance(days=30):
         out+=['',f'🏆 أفضل يوم: {_fmt_day(d_)} — {w_} من {n_} حققت الهدف']
     out+=['','⚠️ الأداء السابق لا يضمن النتائج المستقبلية.']
     return '\n'.join(out)
+
+
+def send_premarket(uid):
+    """آخر «نظرة قبل الافتتاح»: الشارت وتحته التعليق، زي القناة بالظبط."""
+    import base64
+    with Session() as db:
+        p=db.scalars(select(PremarketPost).order_by(PremarketPost.id.desc()).limit(1)).first()
+    if not p:
+        send(uid,'لا توجد نظرة قبل الافتتاح متاحة حاليًا. تُنشر يوميًا قبل افتتاح السوق الأمريكي.',MAIN_MENU);return
+    today=utcnow().astimezone(NY).strftime('%Y-%m-%d')
+    cap=p.caption if p.day==today else 'ℹ️ هذه آخر نظرة منشورة، وستُنشر نظرة اليوم قبل افتتاح السوق.\n\n'+p.caption
+    try:send_photo(uid,base64.b64decode(p.image_b64),cap[:1024],MAIN_MENU)
+    except Exception:
+        LOG.exception('premarket photo failed');send(uid,cap,MAIN_MENU)
 
 
 def mine(tid):
@@ -332,6 +346,11 @@ def interact(uid,username,data):
 def process(update):
     msg=update.get('message')
     cb=update.get('callback_query')
+    if cb and cb.get('data')=='pre':
+        uid=cb['from']['id'];ensure_user(uid,cb['from'].get('username',''))
+        call('answerCallbackQuery',{'callback_query_id':cb['id']})
+        send_premarket(uid)
+        return
     if cb:
         uid=cb['from']['id'];username=cb['from'].get('username','')
         response=interact(uid,username,cb.get('data',''))
@@ -378,7 +397,7 @@ def process(update):
             _notify_admins(f'✉️ رسالة من عميل\nالعميل: {who}\nالـ ID: {uid}\n\n{text[:1500]}\n\nللرد: /r {uid} الرسالة')
             send(uid,'✅ وصلت رسالتك إلى فريق الصفوة، وسنرد عليك في أقرب وقت.',MAIN_MENU)
             return
-        send(uid,'أهلًا بك في الصفوة 👑\nيمكنك الاستمتاع بتجربة مجانية لمدة جلستين تداول، وبعدها التواصل معنا في حال الرغبة في استمرار الخدمة.',MAIN_MENU)
+        send(uid,'أهلًا بك في الصفوة 👑\nقم بتفعيل التجربة المجانية لمدة جلستين تداول، وبعدها التواصل معنا في حال الرغبة في استمرار الخدمة.',MAIN_MENU)
 
 def deliver_historical():
     """Send queued onboarding history to active accounts, with no new-trade implication."""

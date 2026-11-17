@@ -5,7 +5,7 @@ import os, json, hmac
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import select
-from common import Session, Customer, Event, Delivery, Payment, queue_recent_closed, grant, active, utcnow
+from common import Session, Customer, Event, Delivery, Payment, PremarketPost, queue_recent_closed, grant, active, utcnow
 from telegram_api import send
 
 app=FastAPI(title='Rajih Customer API',docs_url=None,redoc_url=None)
@@ -17,7 +17,7 @@ class Incoming(BaseModel):
     event_key:str=Field(min_length=1,max_length=200)
     signal_id:str=Field(min_length=1,max_length=120)
     symbol:str=Field(min_length=1,max_length=32)
-    kind:str=Field(pattern='^(open|target1|target2|stop|eod|notice)$')
+    kind:str=Field(pattern='^(open|activated|cancelled|target1|target2|stop|eod|notice)$')
     message:str=Field(min_length=1,max_length=3000)
 
 @app.get('/health')
@@ -41,6 +41,22 @@ def create_event(event:Incoming,x_bridge_key:str|None=Header(None)):
                  .where(Event.signal_id==event.signal_id,Event.kind=='open',Delivery.status=='sent')).all()
         for tid in set(ids): db.add(Delivery(event_id=row.id,telegram_id=tid))
         return {'ok':True,'queued':len(set(ids))}
+
+class PremarketIn(BaseModel):
+    day:str=Field(pattern=r'^\d{4}-\d{2}-\d{2}$')
+    caption:str=Field(min_length=1,max_length=1024)
+    image_b64:str=Field(min_length=10,max_length=8_000_000)
+
+@app.post('/premarket')
+def create_premarket(p:PremarketIn,x_bridge_key:str|None=Header(None)):
+    """الماسح بيبعت صورة «نظرة قبل الافتتاح»؛ البوت بيعرض آخر واحدة لما العميل يدوس الزرار."""
+    check(x_bridge_key,os.getenv('BRIDGE_SECRET'))
+    with Session.begin() as db:
+        db.add(PremarketPost(day=p.day,caption=p.caption,image_b64=p.image_b64))
+        db.flush()
+        old=db.scalars(select(PremarketPost).order_by(PremarketPost.id.desc()).offset(5)).all()
+        for o in old: db.delete(o)
+    return {'ok':True}
 
 class ExternalConfirmation(BaseModel):
     provider:str=Field(min_length=1,max_length=40)
@@ -66,6 +82,6 @@ def confirmed_payment(x:ExternalConfirmation,x_payment_bridge_key:str|None=Heade
                                                 __import__('common').Request.kind=='subscription',
                                                 __import__('common').Request.status=='pending')).all():
             req.status='approved';req.decided_at=utcnow()
-    try: send(x.telegram_id,f'✅ تم تفعيل اشتراك راجح حتى {until:%Y-%m-%d} (UTC).')
+    try: send(x.telegram_id,f'✅ تم تفعيل اشتراك الصفوة حتى {until:%Y-%m-%d} (UTC).')
     except Exception: pass
     return {'ok':True,'active_until':until.isoformat()}
