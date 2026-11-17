@@ -9,7 +9,7 @@ logging.basicConfig(level=logging.INFO)
 ADMINS={int(s) for s in os.getenv('ADMIN_TELEGRAM_IDS','').replace(' ','').split(',') if s.isdigit()}
 TRIAL_DAYS=int(os.getenv('TRIAL_DAYS','3'))
 PERIOD_DAYS=int(os.getenv('MANUAL_SUBSCRIPTION_DAYS','30'))
-MAIN_MENU=[[{'text':'🎁 طلب تفعيل تجربة','callback_data':'request:trial'}, {'text':'📝 طلب تفعيل اشتراك','callback_data':'request:subscription'}],
+MAIN_MENU=[[{'text':f'🎁 تجربة مجانية ({TRIAL_DAYS} أيام)','callback_data':'request:trial'}, {'text':'💳 الاشتراك الآن','callback_data':'request:subscription'}],
            [{'text':'📈 توصياتي','callback_data':'mine'}, {'text':'👤 حسابي','callback_data':'account'}]]
 
 def ensure_user(tid,username=''):
@@ -24,6 +24,30 @@ def account(tid):
         if not c or not active(c): return 'حالة الاشتراك: غير نشط. تقدري تطلبي تجربة أو تفعيل اشتراك من القائمة.'
         return f'✅ اشتراكك نشط حتى {c.access_until:%Y-%m-%d %H:%M} UTC.'
 
+KIND_AR={
+    'open':'🟢 مفتوحة — لسه ما وصلتش لهدف ولا وقف',
+    'target1':'🎯 حققت الهدف الأول',
+    'target2':'🎯🎯 حققت الهدف الثاني',
+    'stop':'⛔ ضربت وقف الخسارة',
+    'eod':'🔔 تم إغلاقها آخر اليوم من غير هدف ولا وقف',
+}
+
+
+def _entry_price(text):
+    import re
+    m=re.search(r'سعر الدخول:\s*([0-9.]+)',text or '')
+    return m.group(1) if m else ''
+
+
+def _pct(text):
+    """النسبة اللي في رسالة الحدث، زي (+11.93%) أو (-12.00%)."""
+    import re
+    m=re.findall(r'\(([+\-−]?[0-9]+(?:\.[0-9]+)?)%\)',text or '')
+    if not m:return None
+    try:return float(m[-1].replace('−','-'))
+    except ValueError:return None
+
+
 def mine(tid):
     with Session() as db:
         c=db.get(Customer,tid)
@@ -32,26 +56,87 @@ def mine(tid):
                      .where(Delivery.telegram_id==tid,Event.kind=='open',Delivery.status=='sent')
                      .order_by(Event.id.desc()).limit(15)).all())
         if not ids:return 'لا توجد توصيات خاصة مستلمة على حسابك حتى الآن.'
-        out=[]
+        out,rets=[],[]
         for sid in ids[:10]:
-            events=db.scalars(select(Event).where(Event.signal_id==sid).order_by(Event.id.desc()).limit(1)).all()
-            if events:out.append(f'• {events[0].symbol}: {events[0].kind} — {sid}')
-        return 'آخر توصيات حسابك:\n'+'\n'.join(out)
+            evs=db.scalars(select(Event).where(Event.signal_id==sid).order_by(Event.id.desc())).all()
+            if not evs:continue
+            last=next((e for e in evs if e.kind in KIND_AR),evs[0])        # آخر حالة (من غير رسايل التنبيه)
+            opened=next((e for e in evs if e.kind=='open'),None)
+            parts=sid.split(':')
+            day=parts[0] if parts else ''
+            hhmm=':'.join(parts[2:4]) if len(parts)>=4 else ''
+            try:day=datetime.strptime(day,'%Y-%m-%d').strftime('%d/%m')
+            except Exception:pass
+            price=_entry_price(opened.payload if opened else '')
+            line=f'🔷 {last.symbol}\n{KIND_AR.get(last.kind,last.kind)}\n🗓️ {day}'
+            if hhmm:line+=f' الساعة {hhmm} بتوقيت نيويورك'
+            if price:line+=f' — سعر الدخول {price}'
+            pct=_pct(last.payload) if last.kind!='open' else None
+            if pct is not None:
+                line+=f'\n💵 العائد: {pct:+.2f}%'
+                rets.append(pct)
+            out.append(line)
+        tail=''
+        if rets:
+            wins=sum(r>0 for r in rets)
+            tail=(f'\n\n📊 التوصيات اللي خلصت: {len(rets)} — كسبانة {wins}'
+                  f'\nمتوسط العائد: {sum(rets)/len(rets):+.2f}%')
+        return 'آخر توصيات حسابك:\n\n'+'\n\n'.join(out)+tail
 
-def submit_request(tid,kind):
+def _who(tid):
+    with Session() as db:
+        c=db.get(Customer,tid)
+        u=(c.username or '') if c else ''
+    return (f'@{u}' if u else 'مالوش يوزرنيم'), u
+
+
+def _notify_admins(text,keyboard=None):
+    for admin in ADMINS:
+        try:send(admin,text,keyboard)
+        except Exception:LOG.exception('Cannot notify admin')
+
+
+def auto_trial(tid):
+    """التجربة المجانية بتتفعل على طول، مرة واحدة بس لكل حساب تيليجرام (بالـ ID)."""
     with Session.begin() as db:
         c=db.get(Customer,tid)
-        if active(c) and kind=='trial':return 'اشتراكك نشط بالفعل.'
-        if kind=='trial' and c.trial_used:return 'تم استخدام التجربة من قبل.'
-        existing=db.scalar(select(Request.id).where(Request.telegram_id==tid,Request.kind==kind,Request.status=='pending'))
-        if existing:return 'طلبك قيد المراجعة بالفعل.'
-        req=Request(telegram_id=tid,kind=kind);db.add(req);db.flush();rid=req.id
-    label='تجربة' if kind=='trial' else 'اشتراك'
-    for admin in ADMINS:
-        try:send(admin,f'📨 طلب تفعيل {label}\nالعميل: {tid}\nالطلب: #{rid}',
-                 [[{'text':'✅ موافقة','callback_data':f'approve:{rid}'},{'text':'❌ رفض','callback_data':f'reject:{rid}'}]])
-        except Exception:LOG.exception('Cannot notify admin')
-    return f'✅ وصل طلب تفعيل {label} رقم #{rid}. هيوصلك إشعار لما تتم مراجعته.\nلا ترسلي بيانات بطاقتك داخل تليجرام.'
+        if active(c):
+            return f'✅ اشتراكك نشط بالفعل حتى {c.access_until:%Y-%m-%d}.'
+        if c.trial_used:
+            return 'استخدمتي التجربة المجانية قبل كده 🙏\nلو حابة تكملي معانا دوسي «💳 الاشتراك الآن».'
+        until=grant(db,c,TRIAL_DAYS,'trial')
+        req=Request(telegram_id=tid,kind='trial',status='approved');req.decided_at=utcnow()
+        db.add(req)
+        queue_recent_closed(db,tid,int(os.getenv('HISTORY_ON_ACTIVATION_COUNT','5')))
+    who,_=_who(tid)
+    _notify_admins(f'🎁 تجربة مجانية اتفعلت تلقائي\nالعميل: {who}\nالـ ID: {tid}\nلحد: {until:%Y-%m-%d %H:%M} UTC')
+    return (f'🎉 تم تفعيل التجربة المجانية لمدة {TRIAL_DAYS} أيام، لحد {until:%Y-%m-%d}.\n'
+            'التوصيات الجديدة هتوصلك هنا أول ما تنزل.')
+
+
+def subscribe_now(tid):
+    """الاشتراك الآن: بيبعت للإدارة طلب تواصل واشتراك، والإدارة بتفعّل بعد الدفع."""
+    with Session.begin() as db:
+        existing=db.scalar(select(Request.id).where(Request.telegram_id==tid,Request.kind=='subscription',
+                                                     Request.status=='pending'))
+        if existing:
+            return 'طلبك وصلنا قبل كده ✅ وهنتواصل معاكي في أقرب وقت.'
+        req=Request(telegram_id=tid,kind='subscription');db.add(req);db.flush();rid=req.id
+    who,u=_who(tid)
+    kb=[[{'text':'✅ تفعيل الاشتراك','callback_data':f'approve:{rid}'},{'text':'❌ رفض','callback_data':f'reject:{rid}'}]]
+    if u:kb.insert(0,[{'text':'💬 كلّمي العميل','url':f'https://t.me/{u}'}])
+    _notify_admins(f'💳 طلب اشتراك وتواصل\nالعميل: {who}\nالـ ID: {tid}\nالطلب: #{rid}'
+                   + ('' if u else '\n⚠️ العميل مالوش يوزرنيم، فمش هينفع تكلميه من رابط. ردّي عليه من البوت.'),kb)
+    msg=('✅ وصل طلب الاشتراك، وفريق الصفوة هيتواصل معاكي هنا على تيليجرام في أقرب وقت لتفاصيل الاشتراك والدفع.\n'
+         'لا ترسلي بيانات بطاقتك داخل تليجرام.')
+    if not u:
+        msg+='\n\n📌 حسابك مالوش يوزرنيم، فعلشان نعرف نكلمك: حطي يوزرنيم من إعدادات تيليجرام، أو ابعتي هنا رقم واتساب للتواصل.'
+    return msg
+
+
+def submit_request(tid,kind):
+    return auto_trial(tid) if kind=='trial' else subscribe_now(tid)
+
 
 def decide(actor,action,rid):
     if actor not in ADMINS:return 'غير مصرح'
@@ -96,7 +181,22 @@ def process(update):
         return
     if msg and msg['chat']['type']=='private':
         uid=msg['from']['id'];ensure_user(uid,msg['from'].get('username',''))
-        send(uid,'أهلًا بيكي في راجح 👑\nمفيش شراء أو دفع داخل تليجرام. هنا بتقدمي طلب تفعيل وبتتابعي توصياتك.',MAIN_MENU)
+        text=(msg.get('text') or '').strip()
+        # الإدارة: /r <ID> <الرسالة> ← رد على عميل من البوت
+        if uid in ADMINS and text.startswith('/r '):
+            parts=text.split(' ',2)
+            if len(parts)<3 or not parts[1].isdigit():
+                send(uid,'الصيغة: /r <ID العميل> <الرسالة>');return
+            try:send(int(parts[1]),f'📩 رسالة من فريق الصفوة:\n{parts[2]}');send(uid,'✅ اتبعتت')
+            except Exception as exc:send(uid,f'ما اتبعتتش: {str(exc)[:150]}')
+            return
+        # أي رسالة من عميل (غير /start) بتتحول للإدارة، زي رقم الواتساب
+        if text and not text.startswith('/') and uid not in ADMINS:
+            who,_=_who(uid)
+            _notify_admins(f'✉️ رسالة من عميل\nالعميل: {who}\nالـ ID: {uid}\n\n{text[:1500]}\n\nللرد: /r {uid} الرسالة')
+            send(uid,'✅ وصلت رسالتك لفريق الصفوة، وهنرد عليكي في أقرب وقت.',MAIN_MENU)
+            return
+        send(uid,'أهلًا بيكي في الصفوة 👑\nتقدري تبدأي تجربة مجانية على طول، أو تشتركي، وتتابعي توصياتك من هنا.\nمفيش دفع داخل تليجرام.',MAIN_MENU)
 
 def deliver_historical():
     """Send queued onboarding history to active accounts, with no new-trade implication."""
