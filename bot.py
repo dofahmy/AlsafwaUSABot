@@ -54,17 +54,19 @@ def account(tid):
         return f'✅ اشتراكك نشط حتى {c.access_until:%Y-%m-%d %H:%M} UTC.'
 
 KIND_AR={
-    'open':'🟢 مفتوحة — لسه ما وصلتش لهدف ولا وقف',
+    'open':'🟢 مفتوحة — لم تصل إلى هدف أو وقف بعد',
     'target1':'🎯 حققت الهدف الأول',
     'target2':'🎯🎯 حققت الهدف الثاني',
     'stop':'⛔ ضربت وقف الخسارة',
-    'eod':'🔔 تم إغلاقها آخر اليوم من غير هدف ولا وقف',
+    'eod':'🔔 تم إغلاقها نهاية اليوم دون هدف أو وقف',
+    'activated':'🟢 تم تفعيلها — لم تصل إلى هدف أو وقف بعد',
+    'cancelled':'🚫 ملغية لعدم تفعيل سعر الشراء',
 }
 
 
 def _entry_price(text):
     import re
-    m=re.search(r'سعر الدخول:\s*([0-9.]+)',text or '')
+    m=re.search(r'سعر (?:الدخول|الشراء):\s*([0-9.]+)',text or '')
     return m.group(1) if m else ''
 
 
@@ -97,9 +99,12 @@ def mine(tid):
             try:day=datetime.strptime(day,'%Y-%m-%d').strftime('%d/%m')
             except Exception:pass
             price=_entry_price(opened.payload if opened else '')
-            line=f'🔷 {last.symbol}\n{KIND_AR.get(last.kind,last.kind)}\n🗓️ {day}'
+            label=KIND_AR.get(last.kind,last.kind)
+            if last.kind=='open' and '⏳' in (last.payload or ''):
+                label='⏳ في انتظار التفعيل — لم ينزل السعر إلى سعر الشراء بعد'
+            line=f'🔷 {last.symbol}\n{label}\n🗓️ {day}'
             if hhmm:line+=f' الساعة {hhmm} بتوقيت نيويورك'
-            if price:line+=f' — سعر الدخول {price}'
+            if price:line+=f' — سعر الشراء {price}'
             pct=_pct(last.payload) if last.kind!='open' else None
             if pct is not None:
                 line+=f'\n💵 العائد: {pct:+.2f}%'
@@ -108,7 +113,7 @@ def mine(tid):
         tail=''
         if rets:
             wins=sum(r>0 for r in rets)
-            tail=(f'\n\n📊 التوصيات اللي خلصت: {len(rets)} — كسبانة {wins}'
+            tail=(f'\n\n📊 التوصيات المنتهية: {len(rets)} — الرابحة منها: {wins}'
                   f'\nمتوسط العائد: {sum(rets)/len(rets):+.2f}%')
         return 'آخر توصيات حسابك:\n\n'+'\n\n'.join(out)+tail
 
@@ -116,7 +121,7 @@ def _who(tid):
     with Session() as db:
         c=db.get(Customer,tid)
         u=(c.username or '') if c else ''
-    return (f'@{u}' if u else 'مالوش يوزرنيم'), u
+    return (f'@{u}' if u else 'ليس له اسم مستخدم'), u
 
 
 def _notify_admins(text,keyboard=None):
@@ -132,18 +137,18 @@ def auto_trial(tid):
         if active(c):
             return f'✅ اشتراكك نشط بالفعل حتى {c.access_until:%Y-%m-%d}.'
         if c.trial_used:
-            return 'لقد استخدمت التجربة المجانية من قبل 🙏\nلو حابب تكمل معانا اضغط «💳 الاشتراك الآن».'
+            return 'لقد استخدمت التجربة المجانية من قبل 🙏\nإذا رغبت في الاستمرار معنا اضغط «💳 الاشتراك الآن».'
         until=trial_until()
         c.access_until=until;c.status='active';c.trial_used=True;db.add(c)
         req=Request(telegram_id=tid,kind='trial',status='approved');req.decided_at=utcnow()
         db.add(req)
         queue_recent_closed(db,tid,int(os.getenv('HISTORY_ON_ACTIVATION_COUNT','5')))
     who,_=_who(tid)
-    _notify_admins(f'🎁 تجربة مجانية اتفعلت تلقائي\nالعميل: {who}\nالـ ID: {tid}\nلحد: {until:%Y-%m-%d %H:%M} UTC')
+    _notify_admins(f'🎁 تم تفعيل تجربة مجانية تلقائيًا\nالعميل: {who}\nالـ ID: {tid}\nحتى: {until:%Y-%m-%d %H:%M} UTC')
     end_ny=until.astimezone(NY)
     return (f'🎉 تم تفعيل التجربة المجانية لمدة جلستين تداول، وتنتهي يوم {end_ny:%d/%m} الساعة 8 مساءً بتوقيت نيويورك.\n'
-            'التوصيات الجديدة هتوصلك هنا أول ما تنزل.\n'
-            'وبعد التجربة تقدر تتواصل معانا من «💳 الاشتراك الآن» لو حابب تستمر في الخدمة.')
+            'ستصلك التوصيات الجديدة هنا فور صدورها.\n'
+            'وبعد انتهاء التجربة يمكنك التواصل معنا من «💳 الاشتراك الآن» إذا رغبت في استمرار الخدمة.')
 
 
 def subscribe_now(tid):
@@ -158,15 +163,15 @@ def subscribe_now(tid):
     who,u=_who(tid)
     kb=[[{'text':'✅ تفعيل الاشتراك','callback_data':f'approve:{rid}'},{'text':'❌ رفض','callback_data':f'reject:{rid}'}]]
     if u:kb.insert(0,[{'text':'💬 تواصل مع العميل','url':f'https://t.me/{u}'}])
-    if not ADMINS:LOG.error('ADMIN_TELEGRAM_IDS فاضي — طلبات الاشتراك مش هتوصل لحد')
+    if not ADMINS:LOG.error('ADMIN_TELEGRAM_IDS فارغ — لن تصل طلبات الاشتراك لأحد')
     _notify_admins(f'💳 {"تذكير: " if again else ""}طلب اشتراك وتواصل\nالعميل: {who}\nالـ ID: {tid}\nالطلب: #{rid}'
-                   + ('' if u else '\n⚠️ العميل مالوش يوزرنيم، فمش هينفع التواصل معاه من رابط. الرد عليه من البوت بأمر /r.'),kb)
+                   + ('' if u else '\n⚠️ العميل ليس له اسم مستخدم، فلا يمكن التواصل معه عبر رابط. يمكن الرد عليه من البوت بأمر /r.'),kb)
     if again:
-        return 'طلبك وصلنا قبل كده ✅ وبلّغنا الفريق تاني، وهنتواصل معاك في أقرب وقت.'
-    msg=('✅ وصل طلب الاشتراك، وفريق الصفوة هيتواصل معاك هنا على تيليجرام في أقرب وقت لتفاصيل الاشتراك والدفع.\n'
+        return 'وصلنا طلبك من قبل ✅ وتم تذكير الفريق، وسنتواصل معك في أقرب وقت.'
+    msg=('✅ وصل طلب الاشتراك، وسيتواصل معك فريق الصفوة هنا على تيليجرام في أقرب وقت لتوضيح تفاصيل الاشتراك والدفع.\n'
          'من فضلك لا ترسل بيانات بطاقتك داخل تليجرام.')
     if not u:
-        msg+='\n\n📌 حسابك مالوش يوزرنيم، فعلشان نعرف نكلمك: ضيف يوزرنيم من إعدادات تيليجرام، أو ابعت هنا رقم واتساب للتواصل.'
+        msg+='\n\n📌 حسابك ليس له اسم مستخدم، ولكي نتمكن من التواصل معك: أضف اسم مستخدم من إعدادات تيليجرام، أو أرسل هنا رقم واتساب للتواصل.'
     return msg
 
 
@@ -189,15 +194,15 @@ def ask_days(actor,rid):
         if not req or req.status!='pending':return 'الطلب تمت معالجته أو غير موجود.'
         tid=req.telegram_id
         cur=db.get(Customer,tid)
-        cur_line=(f'\nاشتراكه الحالي شغال لحد {cur.access_until.astimezone(NY):%d/%m/%Y}، والمدة الجديدة هتبدأ من النهارده.'
+        cur_line=(f'\nاشتراكه الحالي ساري حتى {cur.access_until.astimezone(NY):%d/%m/%Y}، وستبدأ المدة الجديدة من اليوم.'
                   if active(cur) else '')
     who,_=_who(tid)
     rows=[]
     for i in range(0,len(DAY_CHOICES),4):
         rows.append([{'text':_days(d),'callback_data':f'grant:{rid}:{d}'} for d in DAY_CHOICES[i:i+4]])
     rows.append([{'text':'❌ إلغاء','callback_data':'noop'}])
-    return (f'⏳ تفعيل اشتراك الطلب #{rid}\nالعميل: {who} (ID: {tid}){cur_line}\n\nاختار مدة الاشتراك (من النهارده).\n'
-            f'أو لعدد أيام تاني ابعت: /sub {rid} عدد_الأيام\nمثال: /sub {rid} 45'),rows
+    return (f'⏳ تفعيل اشتراك الطلب #{rid}\nالعميل: {who} (ID: {tid}){cur_line}\n\nاختر مدة الاشتراك (تبدأ من اليوم).\n'
+            f'أو لعدد أيام آخر أرسل: /sub {rid} عدد_الأيام\nمثال: /sub {rid} 45'),rows
 
 
 def decide(actor,action,rid,days=None):
@@ -218,11 +223,11 @@ def decide(actor,action,rid,days=None):
             queued_history=queue_recent_closed(db,req.telegram_id,int(os.getenv('HISTORY_ON_ACTIVATION_COUNT','5')))
             end_ny=until.astimezone(NY)
             notice=(f'✅ تم تفعيل اشتراكك في الصفوة لمدة {_days(days)}، وينتهي يوم {end_ny:%d/%m/%Y}.\n'
-                    'التوصيات الجديدة هتوصلك هنا أول ما تنزل. أهلًا بيك 👑')
-            admin_msg=f'✅ اتفعّل اشتراك {_days(days)} للعميل {req.telegram_id}، لحد {end_ny:%d/%m/%Y}.'
+                    'ستصلك التوصيات الجديدة هنا فور صدورها. أهلًا بك 👑')
+            admin_msg=f'✅ تم تفعيل اشتراك {_days(days)} للعميل {req.telegram_id} حتى {end_ny:%d/%m/%Y}.'
         else:
             req.status='rejected';notice='تمت مراجعة طلب التفعيل، ولم تتم الموافقة عليه.'
-            admin_msg='❌ اترفض الطلب.'
+            admin_msg='❌ تم رفض الطلب.'
         req.decided_at=utcnow();target=req.telegram_id
     try:send(target,notice)
     except Exception:LOG.exception('Notification failed')
@@ -238,12 +243,12 @@ def interact(uid,username,data):
         _,rid,days=(data.split(':')+['',''])[:3]
         if not (rid.isdigit() and days.isdigit()):return 'طلب غير صحيح.'
         return decide(uid,'approve',int(rid),int(days))
-    if data=='noop':return 'تمام، ما اتفعّلش حاجة.'
+    if data=='noop':return 'تم الإلغاء، ولم يُفعَّل أي شيء.'
     if data=='request:trial':return submit_request(uid,'trial')
     if data=='request:subscription':return submit_request(uid,'subscription')
     if data=='mine':return mine(uid)
     if data=='account':return account(uid)
-    return 'اختار من القائمة.'
+    return 'اختر من القائمة.'
 
 def process(update):
     msg=update.get('message')
@@ -273,28 +278,28 @@ def process(update):
             n=int(p[2])
             with Session.begin() as db:
                 c=db.get(Customer,int(p[1]))
-                if not c:send(uid,'العميل ده مش موجود في البوت.');return
+                if not c:send(uid,'هذا العميل غير موجود في البوت.');return
                 c.access_until=utcnow()+timedelta(days=n) if n else utcnow()-timedelta(seconds=1)
                 c.status='active' if n else 'inactive';db.add(c);until=c.access_until
-            send(uid,f'✅ اشتراك العميل {p[1]} بقى لحد {until.astimezone(NY):%d/%m/%Y}.' if n else f'⛔ اشتراك العميل {p[1]} اتوقف.')
+            send(uid,f'✅ أصبح اشتراك العميل {p[1]} ساريًا حتى {until.astimezone(NY):%d/%m/%Y}.' if n else f'⛔ تم إيقاف اشتراك العميل {p[1]}.')
             return
         if text=='/myid':
-            send(uid,f'الـ ID بتاعك: {uid}');return
+            send(uid,f'رقم حسابك (ID): {uid}');return
         # الإدارة: /r <ID> <الرسالة> ← رد على عميل من البوت
         if uid in ADMINS and text.startswith('/r '):
             parts=text.split(' ',2)
             if len(parts)<3 or not parts[1].isdigit():
                 send(uid,'الصيغة: /r <ID العميل> <الرسالة>');return
-            try:send(int(parts[1]),f'📩 رسالة من فريق الصفوة:\n{parts[2]}');send(uid,'✅ اتبعتت')
-            except Exception as exc:send(uid,f'ما اتبعتتش: {str(exc)[:150]}')
+            try:send(int(parts[1]),f'📩 رسالة من فريق الصفوة:\n{parts[2]}');send(uid,'✅ تم الإرسال')
+            except Exception as exc:send(uid,f'لم يتم الإرسال: {str(exc)[:150]}')
             return
         # أي رسالة من عميل (غير /start) بتتحول للإدارة، زي رقم الواتساب
         if text and not text.startswith('/') and uid not in ADMINS:
             who,_=_who(uid)
             _notify_admins(f'✉️ رسالة من عميل\nالعميل: {who}\nالـ ID: {uid}\n\n{text[:1500]}\n\nللرد: /r {uid} الرسالة')
-            send(uid,'✅ وصلت رسالتك لفريق الصفوة، وهنرد عليك في أقرب وقت.',MAIN_MENU)
+            send(uid,'✅ وصلت رسالتك إلى فريق الصفوة، وسنرد عليك في أقرب وقت.',MAIN_MENU)
             return
-        send(uid,'أهلًا بيك في الصفوة 👑\nيمكنك الاستمتاع بتجربة مجانية لمدة جلستين تداول، وبعدها التواصل معنا في حال الرغبة في استمرار الخدمة.',MAIN_MENU)
+        send(uid,'أهلًا بك في الصفوة 👑\nيمكنك الاستمتاع بتجربة مجانية لمدة جلستين تداول، وبعدها التواصل معنا في حال الرغبة في استمرار الخدمة.',MAIN_MENU)
 
 def deliver_historical():
     """Send queued onboarding history to active accounts, with no new-trade implication."""
