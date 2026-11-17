@@ -174,8 +174,33 @@ def submit_request(tid,kind):
     return auto_trial(tid) if kind=='trial' else subscribe_now(tid)
 
 
-def decide(actor,action,rid):
+DAY_CHOICES=[7,14,30,60,90,180,365]
+
+
+def _days(n):
+    return f'{n} {"أيام" if 3<=n<=10 else "يوم"}'
+
+
+def ask_days(actor,rid):
+    """لما الإدارة تدوس «تفعيل الاشتراك»: البوت بيسأل المدة الأول، وما بيفعّلش غير بعد اختيارها."""
     if actor not in ADMINS:return 'غير مصرح'
+    with Session() as db:
+        req=db.get(Request,rid)
+        if not req or req.status!='pending':return 'الطلب تمت معالجته أو غير موجود.'
+        tid=req.telegram_id
+    who,_=_who(tid)
+    rows=[]
+    for i in range(0,len(DAY_CHOICES),4):
+        rows.append([{'text':_days(d),'callback_data':f'grant:{rid}:{d}'} for d in DAY_CHOICES[i:i+4]])
+    rows.append([{'text':'❌ إلغاء','callback_data':'noop'}])
+    return (f'⏳ تفعيل اشتراك الطلب #{rid}\nالعميل: {who} (ID: {tid})\n\nاختار مدة الاشتراك.\n'
+            f'أو لعدد أيام تاني ابعت: /sub {rid} عدد_الأيام\nمثال: /sub {rid} 45'),rows
+
+
+def decide(actor,action,rid,days=None):
+    if actor not in ADMINS:return 'غير مصرح'
+    if action=='approve' and days is None:
+        return ask_days(actor,rid)
     with Session.begin() as db:
         req=db.get(Request,rid)
         if not req or req.status!='pending':return 'الطلب تمت معالجته أو غير موجود.'
@@ -183,16 +208,20 @@ def decide(actor,action,rid):
         if action=='approve':
             if req.kind=='trial' and (c.trial_used or active(c)):return 'التجربة غير متاحة لهذا الحساب.'
             # Subscription approval is a manual administrative attestation of external payment.
-            until=grant(db,c,TRIAL_DAYS if req.kind=='trial' else PERIOD_DAYS,req.kind)
+            until=grant(db,c,days,req.kind)
             req.status='approved'
             queued_history=queue_recent_closed(db,req.telegram_id,int(os.getenv('HISTORY_ON_ACTIVATION_COUNT','5')))
-            notice=f'✅ تم تفعيل {"التجربة" if req.kind=="trial" else "الاشتراك"} حتى {until:%Y-%m-%d} UTC.'
+            end_ny=until.astimezone(NY)
+            notice=(f'✅ تم تفعيل اشتراكك في الصفوة لمدة {_days(days)}، وينتهي يوم {end_ny:%d/%m/%Y}.\n'
+                    'التوصيات الجديدة هتوصلك هنا أول ما تنزل. أهلًا بيك 👑')
+            admin_msg=f'✅ اتفعّل اشتراك {_days(days)} للعميل {req.telegram_id}، لحد {end_ny:%d/%m/%Y}.'
         else:
             req.status='rejected';notice='تمت مراجعة طلب التفعيل، ولم تتم الموافقة عليه.'
+            admin_msg='❌ اترفض الطلب.'
         req.decided_at=utcnow();target=req.telegram_id
     try:send(target,notice)
     except Exception:LOG.exception('Notification failed')
-    return 'تمت معالجة الطلب.'
+    return admin_msg
 
 def interact(uid,username,data):
     ensure_user(uid,username)
@@ -200,6 +229,11 @@ def interact(uid,username,data):
         action,rid=data.split(':',1)
         if not rid.isdigit():return 'طلب غير صحيح.'
         return decide(uid,action,int(rid))
+    if data.startswith('grant:'):
+        _,rid,days=(data.split(':')+['',''])[:3]
+        if not (rid.isdigit() and days.isdigit()):return 'طلب غير صحيح.'
+        return decide(uid,'approve',int(rid),int(days))
+    if data=='noop':return 'تمام، ما اتفعّلش حاجة.'
     if data=='request:trial':return submit_request(uid,'trial')
     if data=='request:subscription':return submit_request(uid,'subscription')
     if data=='mine':return mine(uid)
@@ -212,12 +246,20 @@ def process(update):
     if cb:
         uid=cb['from']['id'];username=cb['from'].get('username','')
         response=interact(uid,username,cb.get('data',''))
+        kb=MAIN_MENU
+        if isinstance(response,tuple):response,kb=response
         call('answerCallbackQuery',{'callback_query_id':cb['id'],'text':response[:190],'show_alert':False})
-        send(uid,response,MAIN_MENU)
+        send(uid,response,kb)
         return
     if msg and msg['chat']['type']=='private':
         uid=msg['from']['id'];ensure_user(uid,msg['from'].get('username',''))
         text=(msg.get('text') or '').strip()
+        # الإدارة: /sub <رقم الطلب> <عدد الأيام> ← تفعيل اشتراك بعدد أيام مخصص
+        if uid in ADMINS and text.startswith('/sub'):
+            p=text.split()
+            if len(p)!=3 or not p[1].isdigit() or not p[2].isdigit() or int(p[2])<1:
+                send(uid,'الصيغة: /sub <رقم الطلب> <عدد الأيام>\nمثال: /sub 12 45');return
+            send(uid,decide(uid,'approve',int(p[1]),int(p[2])) );return
         if text=='/myid':
             send(uid,f'الـ ID بتاعك: {uid}');return
         # الإدارة: /r <ID> <الرسالة> ← رد على عميل من البوت
