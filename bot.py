@@ -132,10 +132,9 @@ def performance(days=30):
          '📌 ملخص',
          f"• عدد التوصيات: {_count(len(rows),'توصية','توصيات')} خلال {_count(sessions,'جلسة','جلسات')} تداول",
          f'• تم تفعيلها: {len(act)} — ملغية لعدم التفعيل: {canc}']
-    if dec:out.append(f'• نسبة النجاح: {len(wins)/dec:.0%} ({len(wins)} من {dec})')
     out+=['','🎯 النتائج',
+          f"• حققت الهدف الأول: {sum(r['res'] in ('target1','target2') for r in act)}",
           f"• حققت الهدف الثاني: {sum(r['res']=='target2' for r in act)}",
-          f"• حققت الهدف الأول: {sum(r['res']=='target1' for r in act)}",
           f'• ضربت وقف الخسارة: {len(stops)}',
           f"• أُغلقت نهاية اليوم دون هدف أو وقف: {sum(r['res']=='eod' for r in act)}"]
     still=sum(r['res'] in ('open','pending') for r in rows)
@@ -146,18 +145,6 @@ def performance(days=30):
               f"• متوسط عائد التوصية: {sum(r['pct'] for r in rets)/len(rets):+.1f}%",
               f"• أفضل توصية: {best['sym']} \u200e{best['pct']:+.1f}%"]
         if worst['pct']<0:out.append(f"• أكبر خسارة: {worst['sym']} \u200e{worst['pct']:+.1f}%")
-    weeks=[]
-    ws=start
-    while ws<=today:
-        we=min(ws+timedelta(days=6),today)
-        wr=[r for r in act if ws<=r['d']<=we]
-        if wr:
-            w_w=sum(r['res'] in ('target1','target2') for r in wr);w_l=sum(r['res']=='stop' for r in wr)
-            line=f"• {_fmt_day(ws)} – {_fmt_day(we)}: {_count(len(wr),'توصية','توصيات')}"
-            if w_w+w_l:line+=f' — نجاح {w_w/(w_w+w_l):.0%}'
-            weeks.append(line)
-        ws=we+timedelta(days=1)
-    if weeks:out+=['','📅 الأسابيع']+weeks
     byday=defaultdict(list)
     for r in act:byday[r['d']].append(r)
     cand=[(sum(x['res'] in ('target1','target2') for x in v),sum(x['res'] in ('target1','target2','stop') for x in v),d)
