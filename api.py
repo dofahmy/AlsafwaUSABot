@@ -5,7 +5,7 @@ import os, json, hmac
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import select
-from common import Session, Customer, Event, Delivery, Payment, PremarketPost, queue_recent_closed, grant, active, utcnow
+from common import Session, Customer, Event, Delivery, Payment, PremarketPost, queue_recent_closed, grant, active, utcnow, eligible, apply_signal_event, add_credits
 from telegram_api import send
 
 app=FastAPI(title='Rajih Customer API',docs_url=None,redoc_url=None)
@@ -32,15 +32,19 @@ def create_event(event:Incoming,x_bridge_key:str|None=Header(None)):
         row=Event(event_key=event.event_key,signal_id=event.signal_id,symbol=event.symbol,
                   kind=event.kind,payload=event.message)
         db.add(row);db.flush()
-        # An update goes only to recipients of the initial signal. New subscribers don't receive historical alerts.
+        # التوصية الجديدة: لكل عميل عنده رصيد أو في التجربة. المتابعة: لكل اللي استلموا التوصية نفسها.
         if event.kind=='open':
-            targets=db.scalars(select(Customer).where(Customer.status=='active')).all()
-            ids=[c.telegram_id for c in targets if active(c)]
+            ids=[c.telegram_id for c in db.scalars(select(Customer)).all() if eligible(db,c.telegram_id)]
         else:
             ids=db.scalars(select(Delivery.telegram_id).join(Event,Event.id==Delivery.event_id)
-                 .where(Event.signal_id==event.signal_id,Event.kind=='open',Delivery.status=='sent')).all()
-        for tid in set(ids): db.add(Delivery(event_id=row.id,telegram_id=tid))
-        return {'ok':True,'queued':len(set(ids))}
+                 .where(Event.signal_id==event.signal_id,Event.kind=='open')).all()
+        ids=sorted(set(ids))
+        for tid in ids: db.add(Delivery(event_id=row.id,telegram_id=tid))
+        low=apply_signal_event(db,event.kind,event.signal_id,ids)
+    for tid in low:                     # تنبيه: فاضل توصيتين في الرصيد
+        try:send(tid,'🔔 تبقى في رصيدك توصيتان. يمكنك إضافة باقة جديدة في أي وقت من «💳 اشترك الآن».')
+        except Exception: pass
+    return {'ok':True,'queued':len(ids)}
 
 class PremarketIn(BaseModel):
     day:str=Field(pattern=r'^\d{4}-\d{2}-\d{2}$')
@@ -62,7 +66,7 @@ class ExternalConfirmation(BaseModel):
     provider:str=Field(min_length=1,max_length=40)
     provider_payment_id:str=Field(min_length=1,max_length=180)
     telegram_id:int
-    period_days:int=Field(ge=1,le=366)
+    period_days:int=Field(ge=1,le=1000)     # عدد التوصيات المضافة
 
 @app.post('/internal/confirmed-payment')
 def confirmed_payment(x:ExternalConfirmation,x_payment_bridge_key:str|None=Header(None)):
@@ -76,12 +80,12 @@ def confirmed_payment(x:ExternalConfirmation,x_payment_bridge_key:str|None=Heade
         if not customer: raise HTTPException(404,'Customer not registered')
         db.add(Payment(provider=x.provider,provider_payment_id=x.provider_payment_id,
                        telegram_id=x.telegram_id,period_days=x.period_days))
-        until=grant(db,customer,x.period_days,'subscription')
+        bal=add_credits(db,x.telegram_id,x.period_days,f'{x.provider}:{x.provider_payment_id}')
         queue_recent_closed(db,x.telegram_id,int(os.getenv('HISTORY_ON_ACTIVATION_COUNT','5')))
         for req in db.scalars(select(__import__('common').Request).where(__import__('common').Request.telegram_id==x.telegram_id,
                                                 __import__('common').Request.kind=='subscription',
                                                 __import__('common').Request.status=='pending')).all():
             req.status='approved';req.decided_at=utcnow()
-    try: send(x.telegram_id,f'✅ تم تفعيل اشتراك الصفوة حتى {until:%Y-%m-%d} (UTC).')
+    try: send(x.telegram_id,f'✅ تمت إضافة {x.period_days} توصية إلى رصيدك. رصيدك الآن: {bal} توصية.')
     except Exception: pass
-    return {'ok':True,'active_until':until.isoformat()}
+    return {'ok':True,'balance':bal}

@@ -78,13 +78,104 @@ class PremarketPost(Base):
     image_b64=Column(Text,nullable=False)
     created_at=Column(DateTime(timezone=True),default=utcnow)
 
+class Credit(Base):
+    """رصيد العميل بعدد التوصيات (بدل المدة)."""
+    __tablename__='credits'
+    telegram_id=Column(BigInteger,primary_key=True)
+    mode=Column(String(12),default='none',nullable=False)    # none / trial / paid
+    balance=Column(Integer,default=0,nullable=False)          # توصيات مدفوعة متبقية
+    trial_wins=Column(Integer,default=0,nullable=False)       # توصيات ناجحة خلال التجربة
+    updated_at=Column(DateTime(timezone=True),default=utcnow)
+
+class CreditLedger(Base):
+    """كل حركة على الرصيد (شراء، خصم، تعويض، نجاح في التجربة) — حركة واحدة بس لكل توصية ونوع."""
+    __tablename__='credit_ledger'
+    __table_args__=(UniqueConstraint('telegram_id','ref','kind',name='uq_credit_ref_kind'),)
+    id=Column(Integer,primary_key=True,autoincrement=True)
+    telegram_id=Column(BigInteger,nullable=False,index=True)
+    ref=Column(String(180),nullable=False)          # signal_id أو رقم الدفعة
+    kind=Column(String(24),nullable=False)          # charge / refund_cancel / refund_stop / purchase / trial_win / admin
+    delta=Column(Integer,default=0,nullable=False)
+    created_at=Column(DateTime(timezone=True),default=utcnow)
+
 Base.metadata.create_all(engine)
 
+TRIAL_WINS=int(os.getenv('TRIAL_WINS','5'))        # التجربة المجانية = عدد التوصيات الناجحة
+PACKAGE_SIZE=int(os.getenv('PACKAGE_SIZE','10'))   # كل باقة = ١٠ توصيات
+
+
+def credit(db, tid):
+    c=db.get(Credit,tid)
+    if not c:
+        c=Credit(telegram_id=tid,mode='none',balance=0,trial_wins=0);db.add(c);db.flush()
+    return c
+
+
+def eligible(db, tid):
+    """العميل يستلم توصيات جديدة؟ رصيد مدفوع > 0، أو في التجربة ولسه ما وصلش لـ TRIAL_WINS توصية ناجحة."""
+    c=db.get(Credit,tid)
+    if not c:return False
+    return c.balance>0 or (c.mode=='trial' and c.trial_wins<TRIAL_WINS)
+
+
 def active(customer):
-    if not customer or not customer.access_until: return False
-    dt=customer.access_until
-    if dt.tzinfo is None: dt=dt.replace(tzinfo=timezone.utc)
-    return dt>utcnow()
+    if not customer:return False
+    with Session() as s:
+        return eligible(s,customer.telegram_id)
+
+
+def has_purchased(db, tid):
+    return bool(db.scalar(select(CreditLedger.id).where(CreditLedger.telegram_id==tid,CreditLedger.kind.in_(('purchase','admin')))))
+
+
+def _ledger(db, tid, ref, kind, delta):
+    """حركة على الرصيد مرة واحدة بس لنفس (العميل، المرجع، النوع). بترجّع False لو اتعملت قبل كده."""
+    if db.scalar(select(CreditLedger.id).where(CreditLedger.telegram_id==tid,CreditLedger.ref==ref,CreditLedger.kind==kind)):
+        return False
+    db.add(CreditLedger(telegram_id=tid,ref=ref,kind=kind,delta=delta));db.flush()
+    return True
+
+
+def add_credits(db, tid, n, ref, kind='purchase'):
+    """شراء أو إضافة من الإدارة: n توصية زيادة على الرصيد."""
+    cust=db.get(Customer,tid)
+    c=credit(db,tid)
+    if not _ledger(db,tid,ref,kind,n):return c.balance
+    c.balance+=n;c.mode='paid';c.updated_at=utcnow()
+    if cust:cust.status='active'
+    return c.balance
+
+
+def start_trial(db, customer):
+    c=credit(db,customer.telegram_id)
+    c.mode='trial';c.trial_wins=0;c.updated_at=utcnow()
+    customer.trial_used=True;customer.status='active'
+
+
+def apply_signal_event(db, kind, signal_id, recipients):
+    """خصم/تعويض الرصيد حسب الحدث. بيرجّع العملا اللي رصيدهم وصل ٢ (للتنبيه).
+    open: خصم توصية من الرصيد المدفوع (المجاني في التجربة).
+    cancelled: التوصية ما اتفعلتش ← ترجع للرصيد.
+    stop: التوصية خسرت ← تعويض بتوصية.
+    target1: في التجربة ← تتحسب توصية ناجحة."""
+    low=[]
+    for tid in set(recipients):
+        c=credit(db,tid)
+        charged=bool(db.scalar(select(CreditLedger.id).where(CreditLedger.telegram_id==tid,CreditLedger.ref==signal_id,
+                                                             CreditLedger.kind=='charge')))
+        if kind=='open':
+            if c.balance>0 and _ledger(db,tid,signal_id,'charge',-1):
+                c.balance-=1
+                if c.balance==2:low.append(tid)
+        elif kind=='cancelled':
+            if charged and _ledger(db,tid,signal_id,'refund_cancel',1):c.balance+=1
+            elif not charged and c.mode=='trial':_ledger(db,tid,signal_id,'trial_cancel',0)
+        elif kind=='stop':
+            if charged and _ledger(db,tid,signal_id,'refund_stop',1):c.balance+=1
+        elif kind=='target1':
+            if not charged and c.mode=='trial' and _ledger(db,tid,signal_id,'trial_win',0):c.trial_wins+=1
+        c.updated_at=utcnow()
+    return low
 
 def grant(db, customer, days, kind):
     base=customer.access_until if active(customer) else utcnow()
