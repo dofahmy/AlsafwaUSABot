@@ -65,7 +65,8 @@ def whop_link(tid):
 
 def send_buy(uid):
     url=whop_link(uid)
-    send(uid,f'💳 باقة {PACKAGE_SIZE} توصيات — 50 دولار\nيمكنك شراء أكثر من باقة، ويُضاف رصيدها تلقائيًا بعد الدفع.\n'
+    price=os.getenv('PACKAGE_PRICE','50')
+    send(uid,f'💳 باقة {PACKAGE_SIZE} توصيات — {price} دولار\nيمكنك شراء أكثر من باقة، ويُضاف رصيدها تلقائيًا بعد الدفع.\n'
              'اضغط الزر التالي لإتمام الدفع بأمان عبر Whop.',[[{'text':'💳 ادفع الآن','url':url}]])
 MAIN_MENU=[[{'text':f'🎁 تجربة مجانية ({TRIAL_WINS} توصيات ناجحة)','callback_data':'request:trial'}, SUBSCRIBE_BTN],
            [{'text':'📈 توصياتي','callback_data':'mine'}, {'text':'👤 حسابي','callback_data':'account'}],

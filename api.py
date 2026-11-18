@@ -131,15 +131,21 @@ def _find(d,*keys):
 
 
 def _admins(text):
+    if not ADMINS:print('WHOP: ADMIN_TELEGRAM_IDS فاضي في خدمة الـ API',flush=True)
     for a in ADMINS:
         try:send(a,text)
-        except Exception:pass
+        except Exception as exc:print('WHOP: رسالة الإدارة ما اتبعتتش:',exc,flush=True)
 
 
 @app.post('/whop/webhook')
 async def whop_webhook(req:HTTPRequest):
     body=await req.body()
-    if not _whop_verify(body,{k.lower():v for k,v in req.headers.items()}):
+    hdr={k.lower():v for k,v in req.headers.items()}
+    print('WHOP webhook وصل:',body[:1500].decode('utf-8','replace'),flush=True)
+    if not _whop_verify(body,hdr):
+        print('WHOP webhook: التوقيع غلط — راجعي WHOP_WEBHOOK_SECRET',
+              {k:hdr.get(k) for k in ('webhook-id','webhook-timestamp')},flush=True)
+        _admins('⚠️ Whop بعت إشعار دفع بس التوقيع ما اتطابقش. راجعي WHOP_WEBHOOK_SECRET في خدمة الـ API.')
         raise HTTPException(401,'bad signature')
     ev=json.loads(body or b'{}')
     kind=ev.get('type') or ev.get('action') or ''
@@ -151,7 +157,8 @@ async def whop_webhook(req:HTTPRequest):
     tid=_find(data,'metadata.telegram_id','checkout_configuration.metadata.telegram_id','membership.metadata.telegram_id')
     qty=_find(data,'quantity','line_items.0.quantity')
     amount=_find(data,'subtotal','total','final_amount','amount','usd_total')
-    try:packages=int(qty) if qty else max(1,round(float(amount)/PACKAGE_PRICE)) if amount else 1
+    # المبلغ ممكن ييجي بعملة العميل (زي الجنيه)، فما بنعتمدش عليه: الكمية لو موجودة، وإلا باقة واحدة
+    try:packages=max(1,int(qty)) if qty else 1
     except (TypeError,ValueError):packages=1
     n=packages*PACKAGE_SIZE
     email=_find(data,'user.email','member.email','email') or ''
@@ -167,6 +174,6 @@ async def whop_webhook(req:HTTPRequest):
         db.add(Payment(provider='whop',provider_payment_id=f'whop:{pay_id}',telegram_id=tid,period_days=n))
         bal=add_credits(db,tid,n,f'whop:{pay_id}')
     try:send(tid,f'✅ تم استلام الدفع بنجاح، وأُضيفت {n} توصية إلى رصيدك.\nرصيدك الآن: {bal} توصية. ستصلك التوصيات الجديدة فور صدورها 👑')
-    except Exception:pass
+    except Exception as exc:print('WHOP: رسالة العميل ما اتبعتتش:',exc,flush=True)
     _admins(f'💰 دفعة Whop: العميل {tid} — {packages} باقة ({n} توصية). رصيده الآن {bal}.\nالمبلغ: {amount} — {email}')
     return {'ok':True,'credited':n}
