@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from sqlalchemy import select
 from common import (Session, Customer, Request, Event, Delivery, HistoricalDelivery, PremarketPost, queue_recent_closed,
                     grant, active, utcnow, Credit, credit, eligible, start_trial, add_credits, has_purchased, TRIAL_WINS, PACKAGE_SIZE,
-                    TrialPhone)
+                    TrialPhone, CreditLedger)
 from telegram_api import call,send,send_photo,send_document,send_markup
 LOG=logging.getLogger('rajih.bot')
 logging.basicConfig(level=logging.INFO)
@@ -271,6 +271,20 @@ def send_customers(admin):
     except Exception:LOG.exception('customers csv failed')
 
 
+def reset_customer(tid):
+    """حذف العميل بالكامل (للتجارب): الحساب والرصيد والحركات والرقم والطلبات والرسايل."""
+    from sqlalchemy import delete
+    with Session.begin() as db:
+        found=bool(db.get(Customer,tid))
+        for model,col in ((Credit,Credit.telegram_id),(CreditLedger,CreditLedger.telegram_id),
+                          (TrialPhone,TrialPhone.telegram_id),(Request,Request.telegram_id),
+                          (Delivery,Delivery.telegram_id),(HistoricalDelivery,HistoricalDelivery.telegram_id),
+                          (Customer,Customer.telegram_id)):
+            db.execute(delete(model).where(col==tid))
+    set_expired_commands(tid,False)
+    return found
+
+
 def contact(uid):
     """خدمة العملاء: زرار يفتح محادثة حساب الدعم، أو أي رسالة يكتبها العميل بتتحول للإدارة."""
     expired=expired_state(uid)
@@ -516,6 +530,9 @@ def interact(uid,username,data):
         if not (rid.isdigit() and days.isdigit()):return 'طلب غير صحيح.'
         return decide(uid,'approve',int(rid),int(days))
     if data=='noop':return 'تم الإلغاء، ولم يُفعَّل أي شيء.'
+    if data.startswith('reset:') and uid in ADMINS:
+        tid=int(data.split(':',1)[1])
+        return f'🗑️ تم حذف العميل {tid} بالكامل. يقدر يبدأ من الأول كأنه جديد.' if reset_customer(tid) else 'العميل غير موجود.'
     if data=='request:trial':return submit_request(uid,'trial')
     if data=='request:subscription':return submit_request(uid,'subscription')
     if data=='mine':return mine(uid)
@@ -611,6 +628,15 @@ def process(update):
                 try:send(tid,f'✅ رصيدك في الصفوة الآن: {_days(bal)}.',MAIN_MENU)
                 except Exception:pass
             send(uid,f'✅ رصيد العميل {tid} الآن: {_days(bal)}.' if ok else f'⛔ تم إيقاف اشتراك العميل {tid}.')
+            return
+        # الإدارة: /reset <ID> ← حذف العميل بالكامل (بعد تأكيد)
+        if uid in ADMINS and cmd=='/reset':
+            p=text.split()
+            if len(p)!=2 or not p[1].isdigit():
+                send(uid,'الصيغة: /reset <ID العميل>');return
+            w,_=_who(int(p[1]))
+            send(uid,f'⚠️ هتحذف العميل {w} (ID: {p[1]}) بالكامل: رصيده، وتجربته، ورقمه، وطلباته.\nمتأكدة؟',
+                 [[{'text':'🗑️ تأكيد الحذف','callback_data':f'reset:{p[1]}'},{'text':'❌ إلغاء','callback_data':'noop'}]])
             return
         # الإدارة: /customers ← قايمة كل العملا (رسالة + ملف CSV)
         if uid in ADMINS and cmd=='/customers':
