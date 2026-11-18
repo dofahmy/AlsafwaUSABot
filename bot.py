@@ -52,7 +52,20 @@ BOT_COMMANDS=[
     {'command':'premarket','description':'نظرة قبل الافتتاح'},
     {'command':'contact','description':'خدمة العملاء'},
 ]
-SUPPORT_USERNAME=os.getenv('SUPPORT_USERNAME','').lstrip('@')   # يوزر حساب خدمة العملاء (اختياري)
+SUPPORT_USERNAME=os.getenv('SUPPORT_USERNAME','').lstrip('@')
+
+# الكلام اللي بيظهر لأي حد يفتح البوت قبل ما يدوس «ابدأ» (تحت صورة المدخل)
+BOT_DESCRIPTION="""👑 الصفوة | توصيات لحظية على الأسهم الأمريكية
+
+🎯 توصيات بسعر شراء وهدفين ووقف خسارة واضح
+⚡ تنبيهات فورية عند التفعيل وتحقق الأهداف أو الوقف
+☀️ نظرة يومية قبل افتتاح السوق الأمريكي
+🛡️ مستوى مخاطرة يومي وإدارة واضحة للمراكز
+
+🎁 تجربة مجانية لمدة جلستين تداول
+اضغط «ابدأ» وفعّل تجربتك الآن"""
+# السطر اللي بيظهر في صفحة البوت (About) ولما حد يشارك البوت
+BOT_SHORT_DESCRIPTION="توصيات لحظية على الأسهم الأمريكية بأهداف ووقف خسارة واضح — جرّبها مجانًا لمدة جلستين تداول"   # يوزر حساب خدمة العملاء (اختياري)
 
 def ensure_user(tid,username=''):
     with Session.begin() as db:
@@ -133,7 +146,7 @@ def send_premarket(uid):
     with Session() as db:
         p=db.scalars(select(PremarketPost).order_by(PremarketPost.id.desc()).limit(1)).first()
     if not p:
-        send(uid,'لا توجد نظرة قبل الافتتاح متاحة حاليًا. تُنشر يوميًا قبل افتتاح السوق الأمريكي.',MAIN_MENU);return
+        send(uid,'تُنشر يوميًا قبل افتتاح السوق الأمريكي.',MAIN_MENU);return
     today=utcnow().astimezone(NY).strftime('%Y-%m-%d')
     cap=p.caption if p.day==today else 'ℹ️ هذه آخر نظرة منشورة، وستُنشر نظرة اليوم قبل افتتاح السوق.\n\n'+p.caption
     try:send_photo(uid,base64.b64decode(p.image_b64),cap[:1024],MAIN_MENU)
@@ -428,6 +441,8 @@ def main():
     try:
         call('setMyCommands',{'commands':BOT_COMMANDS})
         call('setChatMenuButton',{'menu_button':{'type':'commands'}})
+        call('setMyDescription',{'description':BOT_DESCRIPTION})
+        call('setMyShortDescription',{'short_description':BOT_SHORT_DESCRIPTION})
     except Exception:LOG.exception('Cannot set bot commands')
     offset=None
     while True:
