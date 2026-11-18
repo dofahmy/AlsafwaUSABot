@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from sqlalchemy import select
 from common import (Session, Customer, Request, Event, Delivery, HistoricalDelivery, PremarketPost, queue_recent_closed,
                     grant, active, utcnow, Credit, credit, eligible, start_trial, add_credits, has_purchased, TRIAL_WINS, PACKAGE_SIZE)
-from telegram_api import call,send,send_photo
+from telegram_api import call,send,send_photo,send_document
 LOG=logging.getLogger('rajih.bot')
 logging.basicConfig(level=logging.INFO)
 ADMINS={int(s) for s in os.getenv('ADMIN_TELEGRAM_IDS','').replace(' ','').split(',') if s.isdigit()}
@@ -207,6 +207,40 @@ def check_expiries():
         set_expired_commands(tid,True)
         who,_=_who(tid)
         _notify_admins(f'⏰ {"انتهى رصيد" if paid else "انتهت تجربة"} العميل {who} (ID: {tid})')
+
+
+def send_customers(admin):
+    """كل العملا: الـ ID واليوزر والحالة والرصيد — رسالة ملخص + ملف CSV فيه كل التفاصيل."""
+    import csv,io
+    with Session() as db:
+        custs=db.scalars(select(Customer).order_by(Customer.created_at)).all()
+        rows=[]
+        for c in custs:
+            cr=db.get(Credit,c.telegram_id)
+            mode=cr.mode if cr else 'none'
+            ok=eligible(db,c.telegram_id)
+            state=('مشترك' if mode=='paid' and ok else 'في التجربة' if mode=='trial' and ok else
+                   'رصيده خلص' if mode=='paid' else 'تجربته خلصت' if mode=='trial' else 'جديد')
+            rows.append({'ID':c.telegram_id,'username':('@'+c.username) if c.username else '',
+                         'الحالة':state,'الرصيد':cr.balance if cr else 0,
+                         'نجاحات التجربة':f'{cr.trial_wins}/{TRIAL_WINS}' if cr and mode=='trial' else '',
+                         'اشترى قبل كده':'نعم' if has_purchased(db,c.telegram_id) else '',
+                         'تاريخ الدخول':c.created_at.astimezone(NY).strftime('%Y-%m-%d') if c.created_at else ''})
+    if not rows:
+        send(admin,'لا يوجد عملاء بعد.');return
+    from collections import Counter
+    cnt=Counter(r['الحالة'] for r in rows)
+    head=f'👥 العملاء: {len(rows)}\n'+' — '.join(f'{k}: {v}' for k,v in cnt.items())
+    lines=[f"{r['ID']} {r['username']} — {r['الحالة']}"+(f" ({r['الرصيد']})" if r['الرصيد'] else '') for r in rows]
+    chunk=head+'\n\n'
+    for ln in lines:
+        if len(chunk)+len(ln)>3800:
+            send(admin,chunk);chunk=''
+        chunk+=ln+'\n'
+    if chunk.strip():send(admin,chunk)
+    buf=io.StringIO();w=csv.DictWriter(buf,fieldnames=list(rows[0].keys()));w.writeheader();w.writerows(rows)
+    try:send_document(admin,buf.getvalue().encode('utf-8-sig'),'safwa_customers.csv','كل العملاء بالتفاصيل')
+    except Exception:LOG.exception('customers csv failed')
 
 
 def contact(uid):
@@ -480,6 +514,9 @@ def process(update):
                 except Exception:pass
             send(uid,f'✅ رصيد العميل {tid} الآن: {_days(bal)}.' if ok else f'⛔ تم إيقاف اشتراك العميل {tid}.')
             return
+        # الإدارة: /customers ← قايمة كل العملا (رسالة + ملف CSV)
+        if uid in ADMINS and cmd=='/customers':
+            send_customers(uid);return
         if text=='/myid':
             send(uid,f'رقم حسابك (ID): {uid}');return
         # الإدارة: /r <ID> <الرسالة> ← رد على عميل من البوت

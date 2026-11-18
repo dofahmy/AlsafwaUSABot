@@ -26,3 +26,13 @@ def send_photo(chat_id,image_bytes,caption='',keyboard=None):
     out=r.json()
     if not out.get('ok'): raise RuntimeError(str(out)[:250])
     return out['result']
+
+def send_document(chat_id,data_bytes,filename,caption=''):
+    """ملف (زي CSV) من البايتات نفسها."""
+    if not TOKEN: raise RuntimeError('CUSTOMER_BOT_TOKEN missing')
+    r=requests.post(f'https://api.telegram.org/bot{TOKEN}/sendDocument',data={'chat_id':str(chat_id),'caption':caption[:1024]},
+                    files={'document':(filename,data_bytes,'text/csv')},timeout=60)
+    r.raise_for_status()
+    out=r.json()
+    if not out.get('ok'): raise RuntimeError(str(out)[:250])
+    return out['result']
