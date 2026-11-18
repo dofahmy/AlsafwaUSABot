@@ -142,7 +142,7 @@ def add_credits(db, tid, n, ref, kind='purchase'):
     c=credit(db,tid)
     if not _ledger(db,tid,ref,kind,n):return c.balance
     c.balance+=n;c.mode='paid';c.updated_at=utcnow()
-    if cust:cust.status='active'
+    if cust and cust.status!='expired':cust.status='active'   # المنتهي بيرجع من فحص البوت (بيرجّع القوايم كمان)
     return c.balance
 
 

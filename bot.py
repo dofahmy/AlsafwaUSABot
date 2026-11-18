@@ -39,9 +39,34 @@ def trial_until(now_utc=None,sessions=None):
     return datetime(d.year,d.month,d.day,20,0,tzinfo=NY).astimezone(timezone.utc)
 
 PERIOD_DAYS=int(os.getenv('MANUAL_SUBSCRIPTION_DAYS','30'))
-WHOP_CHECKOUT_URL=(os.getenv('WHOP_CHECKOUT_URL') or 'https://whop.com/checkout/plan_f6rtn0QJyAfUA').strip()   # صفحة الدفع على Whop
-SUBSCRIBE_BTN=({'text':'💳 اشترك الآن','url':WHOP_CHECKOUT_URL} if WHOP_CHECKOUT_URL else
+WHOP_CHECKOUT_URL=(os.getenv('WHOP_CHECKOUT_URL') or 'https://whop.com/checkout/plan_iD20tgprZcehh').strip()   # باقة ١٠ توصيات
+WHOP_PLAN_ID=os.getenv('WHOP_PLAN_ID') or WHOP_CHECKOUT_URL.rstrip('/').split('/')[-1]
+WHOP_API_KEY=os.getenv('WHOP_API_KEY','').strip()
+# مع مفتاح Whop: الزرار بيعمل لكل عميل صفحة دفع خاصة فيها الـ ID بتاعه، علشان الرصيد يتضاف لوحده بعد الدفع
+SUBSCRIBE_BTN=({'text':'💳 اشترك الآن','callback_data':'buy'} if WHOP_API_KEY else
+               {'text':'💳 اشترك الآن','url':WHOP_CHECKOUT_URL} if WHOP_CHECKOUT_URL else
                {'text':'💳 اشترك الآن','callback_data':'request:subscription'})
+
+
+def whop_link(tid):
+    """صفحة دفع Whop خاصة بالعميل (الـ ID بتاعه في metadata). لو فشلت ← الرابط العام."""
+    import requests as rq
+    if not WHOP_API_KEY:return WHOP_CHECKOUT_URL
+    head={'Authorization':f'Bearer {WHOP_API_KEY}','Content-Type':'application/json'}
+    meta={'telegram_id':str(tid)}
+    for body in ({'variant_id':WHOP_PLAN_ID,'metadata':meta},{'plan_id':WHOP_PLAN_ID,'metadata':meta}):
+        try:
+            r=rq.post('https://api.whop.com/api/v1/checkout_configurations',json=body,headers=head,timeout=20)
+            if r.ok and r.json().get('purchase_url'):return r.json()['purchase_url']
+            LOG.warning('whop checkout %s: %s',r.status_code,r.text[:300])
+        except Exception as exc:LOG.warning('whop checkout failed: %s',exc)
+    return WHOP_CHECKOUT_URL
+
+
+def send_buy(uid):
+    url=whop_link(uid)
+    send(uid,f'💳 باقة {PACKAGE_SIZE} توصيات — 50 دولار\nيمكنك شراء أكثر من باقة، ويُضاف رصيدها تلقائيًا بعد الدفع.\n'
+             'اضغط الزر التالي لإتمام الدفع بأمان عبر Whop.',[[{'text':'💳 ادفع الآن','url':url}]])
 MAIN_MENU=[[{'text':f'🎁 تجربة مجانية ({TRIAL_WINS} توصيات ناجحة)','callback_data':'request:trial'}, SUBSCRIBE_BTN],
            [{'text':'📈 توصياتي','callback_data':'mine'}, {'text':'👤 حسابي','callback_data':'account'}],
            [{'text':'☀️ نظرة قبل الافتتاح','callback_data':'pre'}, {'text':'🎧 خدمة العملاء','callback_data':'contact'}]]
@@ -449,7 +474,9 @@ def process(update):
             if cb:call('answerCallbackQuery',{'callback_query_id':cb['id']})
             data=(cb or {}).get('data','')
             text=((msg or {}).get('text') or '').strip()
-            if data=='request:subscription' and not WHOP_CHECKOUT_URL:
+            if data=='buy' or text.split('@')[0].lower()=='/subscribe' and WHOP_API_KEY:
+                send_buy(who_id)
+            elif data=='request:subscription' and not WHOP_CHECKOUT_URL:
                 send(who_id,subscribe_now(who_id),None)
             elif text and not text.startswith('/'):
                 w,_=_who(who_id)
@@ -458,6 +485,9 @@ def process(update):
             else:
                 send(who_id,ended_short(state),subscribe_kb())
             return
+    if cb and cb.get('data')=='buy':
+        call('answerCallbackQuery',{'callback_query_id':cb['id']})
+        send_buy(cb['from']['id']);return
     if cb and cb.get('data') in ('pre','contact'):
         uid=cb['from']['id'];ensure_user(uid,cb['from'].get('username',''))
         call('answerCallbackQuery',{'callback_query_id':cb['id']})
@@ -476,6 +506,8 @@ def process(update):
         text=(msg.get('text') or '').strip()
         cmd=text.split()[0].split('@')[0].lower() if text.startswith('/') else ''
         # أوامر القائمة
+        if cmd=='/subscribe' and WHOP_API_KEY:
+            send_buy(uid);return
         if cmd=='/subscribe' and WHOP_CHECKOUT_URL:
             send(uid,'💳 اضغط الزر التالي لإتمام الاشتراك والدفع بأمان عبر Whop.',subscribe_kb());return
         if cmd in ('/trial','/subscribe','/mine','/account'):

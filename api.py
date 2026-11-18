@@ -1,11 +1,11 @@
 """Private event ingestion endpoint and external payment confirmation endpoint.
 No payment link or card form is exposed in Telegram.
 """
-import os, json, hmac
-from fastapi import FastAPI, Header, HTTPException
+import os, json, hmac, hashlib, base64, time, logging
+from fastapi import FastAPI, Header, HTTPException, Request as HTTPRequest
 from pydantic import BaseModel, Field
 from sqlalchemy import select
-from common import Session, Customer, Event, Delivery, Payment, PremarketPost, queue_recent_closed, grant, active, utcnow, eligible, apply_signal_event, add_credits
+from common import Session, Customer, Event, Delivery, Payment, PremarketPost, queue_recent_closed, grant, active, utcnow, eligible, apply_signal_event, add_credits, PACKAGE_SIZE
 from telegram_api import send
 
 app=FastAPI(title='Rajih Customer API',docs_url=None,redoc_url=None)
@@ -89,3 +89,84 @@ def confirmed_payment(x:ExternalConfirmation,x_payment_bridge_key:str|None=Heade
     try: send(x.telegram_id,f'✅ تمت إضافة {x.period_days} توصية إلى رصيدك. رصيدك الآن: {bal} توصية.')
     except Exception: pass
     return {'ok':True,'balance':bal}
+
+
+# ---------------- Whop: الدفع بيضيف رصيد لوحده ----------------
+LOG=logging.getLogger('safwa.whop')
+ADMINS=[int(x) for x in os.getenv('ADMIN_TELEGRAM_IDS','').replace(' ','').split(',') if x.isdigit()]
+PACKAGE_PRICE=float(os.getenv('PACKAGE_PRICE','50'))
+
+
+def _whop_verify(body:bytes, headers)->bool:
+    """توقيع Standard Webhooks: v1,base64(HMAC-SHA256(secret, id.timestamp.body))."""
+    secret=os.getenv('WHOP_WEBHOOK_SECRET','')
+    if not secret:return False
+    wid,ts,sigs=headers.get('webhook-id'),headers.get('webhook-timestamp'),headers.get('webhook-signature','')
+    if not (wid and ts and sigs):return False
+    try:
+        if abs(time.time()-int(ts))>600:return False
+    except ValueError:return False
+    signed=f'{wid}.{ts}.'.encode()+body
+    keys=[secret.encode()]
+    raw=secret.split('_',1)[1] if secret.startswith(('whsec_','ws_')) else secret
+    try:keys.append(base64.b64decode(raw+'='*(-len(raw)%4)))
+    except Exception:pass
+    keys.append(raw.encode())
+    expected={base64.b64encode(hmac.new(k,signed,hashlib.sha256).digest()).decode() for k in keys}
+    for part in sigs.split():
+        v=part.split(',',1)[-1]
+        if v in expected:return True
+    return False
+
+
+def _find(d,*keys):
+    """أول قيمة موجودة من أكتر من مكان محتمل في رسالة Whop."""
+    for k in keys:
+        cur=d
+        for p in k.split('.'):
+            cur=cur.get(p) if isinstance(cur,dict) else None
+            if cur is None:break
+        if cur not in (None,'',{}):return cur
+    return None
+
+
+def _admins(text):
+    for a in ADMINS:
+        try:send(a,text)
+        except Exception:pass
+
+
+@app.post('/whop/webhook')
+async def whop_webhook(req:HTTPRequest):
+    body=await req.body()
+    if not _whop_verify(body,{k.lower():v for k,v in req.headers.items()}):
+        raise HTTPException(401,'bad signature')
+    ev=json.loads(body or b'{}')
+    kind=ev.get('type') or ev.get('action') or ''
+    data=ev.get('data') or {}
+    LOG.info('whop %s: %s',kind,json.dumps(ev)[:2000])
+    if kind!='payment.succeeded':
+        return {'ok':True,'ignored':kind}
+    pay_id=str(_find(data,'id') or ev.get('id') or '')
+    tid=_find(data,'metadata.telegram_id','checkout_configuration.metadata.telegram_id','membership.metadata.telegram_id')
+    qty=_find(data,'quantity','line_items.0.quantity')
+    amount=_find(data,'subtotal','total','final_amount','amount','usd_total')
+    try:packages=int(qty) if qty else max(1,round(float(amount)/PACKAGE_PRICE)) if amount else 1
+    except (TypeError,ValueError):packages=1
+    n=packages*PACKAGE_SIZE
+    email=_find(data,'user.email','member.email','email') or ''
+    if not tid or not str(tid).isdigit():
+        _admins(f'💰 دفعة جديدة على Whop من غير ID تيليجرام\nالمبلغ: {amount}\nالإيميل: {email}\nرقم الدفعة: {pay_id}\n'
+                f'أضيفي الرصيد يدويًا: /add ID_العميل {n}')
+        return {'ok':True,'unmatched':True}
+    tid=int(tid)
+    with Session.begin() as db:
+        if db.scalar(select(Payment.id).where(Payment.provider_payment_id==f'whop:{pay_id}')):
+            return {'ok':True,'duplicate':True}
+        if not db.get(Customer,tid):db.add(Customer(telegram_id=tid));db.flush()
+        db.add(Payment(provider='whop',provider_payment_id=f'whop:{pay_id}',telegram_id=tid,period_days=n))
+        bal=add_credits(db,tid,n,f'whop:{pay_id}')
+    try:send(tid,f'✅ تم استلام الدفع بنجاح، وأُضيفت {n} توصية إلى رصيدك.\nرصيدك الآن: {bal} توصية. ستصلك التوصيات الجديدة فور صدورها 👑')
+    except Exception:pass
+    _admins(f'💰 دفعة Whop: العميل {tid} — {packages} باقة ({n} توصية). رصيده الآن {bal}.\nالمبلغ: {amount} — {email}')
+    return {'ok':True,'credited':n}
