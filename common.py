@@ -87,6 +87,13 @@ class Credit(Base):
     trial_wins=Column(Integer,default=0,nullable=False)       # توصيات ناجحة خلال التجربة
     updated_at=Column(DateTime(timezone=True),default=utcnow)
 
+class TrialPhone(Base):
+    """رقم الموبايل اللي اتفعّلت بيه تجربة مجانية — كل رقم تجربة واحدة بس."""
+    __tablename__='trial_phones'
+    phone=Column(String(32),primary_key=True)
+    telegram_id=Column(BigInteger,nullable=False,index=True)
+    created_at=Column(DateTime(timezone=True),default=utcnow)
+
 class CreditLedger(Base):
     """كل حركة على الرصيد (شراء، خصم، تعويض، نجاح في التجربة) — حركة واحدة بس لكل توصية ونوع."""
     __tablename__='credit_ledger'

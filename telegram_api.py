@@ -37,3 +37,8 @@ def send_document(chat_id,data_bytes,filename,caption=''):
     out=r.json()
     if not out.get('ok'): raise RuntimeError(str(out)[:250])
     return out['result']
+
+
+def send_markup(chat_id,text,reply_markup):
+    """رسالة بأي نوع أزرار (زي زرار مشاركة الرقم اللي تحت خانة الكتابة)."""
+    return call('sendMessage',{'chat_id':chat_id,'text':text,'reply_markup':reply_markup,'disable_web_page_preview':True})

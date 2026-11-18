@@ -3,8 +3,9 @@ import os, time, json, logging
 from datetime import datetime, timezone
 from sqlalchemy import select
 from common import (Session, Customer, Request, Event, Delivery, HistoricalDelivery, PremarketPost, queue_recent_closed,
-                    grant, active, utcnow, Credit, credit, eligible, start_trial, add_credits, has_purchased, TRIAL_WINS, PACKAGE_SIZE)
-from telegram_api import call,send,send_photo,send_document
+                    grant, active, utcnow, Credit, credit, eligible, start_trial, add_credits, has_purchased, TRIAL_WINS, PACKAGE_SIZE,
+                    TrialPhone)
+from telegram_api import call,send,send_photo,send_document,send_markup
 LOG=logging.getLogger('rajih.bot')
 logging.basicConfig(level=logging.INFO)
 ADMINS={int(s) for s in os.getenv('ADMIN_TELEGRAM_IDS','').replace(' ','').split(',') if s.isdigit()}
@@ -247,7 +248,8 @@ def send_customers(admin):
             ok=eligible(db,c.telegram_id)
             state=('مشترك' if mode=='paid' and ok else 'في التجربة' if mode=='trial' and ok else
                    'رصيده خلص' if mode=='paid' else 'تجربته خلصت' if mode=='trial' else 'جديد')
-            rows.append({'ID':c.telegram_id,'username':('@'+c.username) if c.username else '',
+            ph=trial_phone(db,c.telegram_id)
+            rows.append({'ID':c.telegram_id,'username':('@'+c.username) if c.username else '','الموبايل':('+'+ph) if ph else '',
                          'الحالة':state,'الرصيد':cr.balance if cr else 0,
                          'نجاحات التجربة':f'{cr.trial_wins}/{TRIAL_WINS}' if cr and mode=='trial' else '',
                          'اشترى قبل كده':'نعم' if has_purchased(db,c.telegram_id) else '',
@@ -345,20 +347,78 @@ def _notify_admins(text,keyboard=None):
         except Exception:LOG.exception('Cannot notify admin')
 
 
-def auto_trial(tid):
-    """التجربة المجانية بتتفعل على طول، مرة واحدة بس لكل حساب تيليجرام (بالـ ID)."""
+PHONE_KB={'keyboard':[[{'text':'📱 مشاركة رقمي','request_contact':True}]],'resize_keyboard':True,'one_time_keyboard':True}
+NO_KB={'remove_keyboard':True}
+
+
+def _norm_phone(p):
+    return ''.join(ch for ch in str(p or '') if ch.isdigit())
+
+
+def ask_phone(tid):
+    """التجربة بتتفعل برقم الموبايل: كل رقم تجربة واحدة بس."""
+    send_markup(tid,'📱 لتفعيل التجربة المجانية، اضغط زر «📱 مشاركة رقمي» بالأسفل للتحقق من رقمك.\n'
+                    'كل رقم موبايل له تجربة مجانية واحدة فقط.',PHONE_KB)
+
+
+def on_contact(msg):
+    """العميل شارك رقمه: نتأكد إنه رقمه هو، وإن الرقم ما خدش تجربة قبل كده، وبعدين نفعّل."""
+    uid=msg['from']['id'];ct=msg.get('contact') or {}
+    if ct.get('user_id')!=uid:
+        send_markup(uid,'⚠️ من فضلك شارك رقمك أنت من زر «📱 مشاركة رقمي».',PHONE_KB);return
+    phone=_norm_phone(ct.get('phone_number'))
+    if len(phone)<8:
+        send_markup(uid,'⚠️ تعذّر قراءة الرقم، حاول مرة أخرى.',PHONE_KB);return
+    with Session.begin() as db:
+        owner=db.get(TrialPhone,phone)
+        if owner and owner.telegram_id!=uid:
+            used=True
+        else:
+            used=False
+            if not owner:db.add(TrialPhone(phone=phone,telegram_id=uid))
+    if used:
+        send_markup(uid,'🙏 هذا الرقم استُخدم في تجربة مجانية من قبل.',NO_KB)
+        send(uid,'يمكنك الاشتراك بباقات التوصيات من «💳 اشترك الآن».',subscribe_kb())
+        w,_=_who(uid)
+        _notify_admins(f'🚫 محاولة تجربة برقم مستخدم قبل كده\nالعميل: {w} (ID: {uid})\nالرقم: +{phone}')
+        return
+    send_markup(uid,'✅ تم التحقق من رقمك.',NO_KB)
+    send(uid,auto_trial(uid,phone),MAIN_MENU)
+
+
+def trial_phone(db,tid):
+    return db.scalar(select(TrialPhone.phone).where(TrialPhone.telegram_id==tid))
+
+
+def request_trial(tid):
+    """زرار/أمر التجربة: لو الرقم لسه ما اتأكدش ← نطلب الرقم. لو اتأكد ← نفعّل."""
+    with Session() as db:
+        c=db.get(Customer,tid)
+        if eligible(db,tid):return 'اشتراكك نشط بالفعل ✅'
+        if c and c.trial_used:
+            return 'لقد استخدمت التجربة المجانية من قبل 🙏\nإذا رغبت في الاستمرار معنا اضغط «💳 اشترك الآن».'
+        phone=trial_phone(db,tid)
+    if not phone:
+        ask_phone(tid);return None
+    return auto_trial(tid,phone)
+
+
+def auto_trial(tid,phone=''):
+    """تفعيل التجربة (بعد التحقق من الرقم)، مرة واحدة بس لكل حساب ولكل رقم."""
     with Session.begin() as db:
         c=db.get(Customer,tid)
         if eligible(db,tid):
             return 'اشتراكك نشط بالفعل ✅'
         if c.trial_used:
             return 'لقد استخدمت التجربة المجانية من قبل 🙏\nإذا رغبت في الاستمرار معنا اضغط «💳 اشترك الآن».'
+        if not phone or not trial_phone(db,tid):
+            return 'لتفعيل التجربة المجانية يجب التحقق من رقم الموبايل أولًا.'
         start_trial(db,c)
         req=Request(telegram_id=tid,kind='trial',status='approved');req.decided_at=utcnow()
         db.add(req)
         queue_recent_closed(db,tid,int(os.getenv('HISTORY_ON_ACTIVATION_COUNT','5')))
     who,_=_who(tid)
-    _notify_admins(f'🎁 تم تفعيل تجربة مجانية تلقائيًا\nالعميل: {who}\nالـ ID: {tid}')
+    _notify_admins(f'🎁 تم تفعيل تجربة مجانية تلقائيًا\nالعميل: {who}\nالـ ID: {tid}\nالرقم: +{phone}')
     return (f'🎉 تم تفعيل التجربة المجانية: ستصلك التوصيات حتى تحقيق {TRIAL_WINS} توصيات ناجحة '
             '(التوصية الناجحة = وصلت للهدف الأول).\n'
             'ستصلك التوصيات الجديدة هنا فور صدورها.\n'
@@ -390,7 +450,7 @@ def subscribe_now(tid):
 
 
 def submit_request(tid,kind):
-    return auto_trial(tid) if kind=='trial' else subscribe_now(tid)
+    return request_trial(tid) if kind=='trial' else subscribe_now(tid)
 
 
 DAY_CHOICES=[10,20,30,50,100]          # عدد التوصيات (باقة = ١٠)
@@ -498,12 +558,16 @@ def process(update):
         uid=cb['from']['id'];username=cb['from'].get('username','')
         response=interact(uid,username,cb.get('data',''))
         kb=MAIN_MENU
+        if response is None:                    # البوت بعت رسالته بنفسه (زي طلب رقم الموبايل)
+            call('answerCallbackQuery',{'callback_query_id':cb['id']});return
         if isinstance(response,tuple):response,kb=response
         call('answerCallbackQuery',{'callback_query_id':cb['id'],'text':response[:190],'show_alert':False})
         send(uid,response,kb)
         return
     if msg and msg['chat']['type']=='private':
         uid=msg['from']['id'];ensure_user(uid,msg['from'].get('username',''))
+        if msg.get('contact'):
+            on_contact(msg);return
         text=(msg.get('text') or '').strip()
         cmd=text.split()[0].split('@')[0].lower() if text.startswith('/') else ''
         # أوامر القائمة
@@ -512,9 +576,10 @@ def process(update):
         if cmd=='/subscribe' and WHOP_CHECKOUT_URL:
             send(uid,'💳 اضغط الزر التالي لإتمام الاشتراك والدفع بأمان عبر Whop.',subscribe_kb());return
         if cmd in ('/trial','/subscribe','/mine','/account'):
-            r={'/trial':lambda:auto_trial(uid),'/subscribe':lambda:subscribe_now(uid),
+            r={'/trial':lambda:request_trial(uid),'/subscribe':lambda:subscribe_now(uid),
                '/mine':lambda:mine(uid),'/account':lambda:account(uid)}[cmd]()
-            send(uid,r,MAIN_MENU);return
+            if r is not None:send(uid,r,MAIN_MENU)
+            return
         if cmd=='/premarket':send_premarket(uid);return
         if cmd=='/contact':contact(uid);return
         # الإدارة: /sub <رقم الطلب> <عدد الأيام> ← تفعيل اشتراك بعدد أيام مخصص
