@@ -430,7 +430,7 @@ def auto_trial(tid,phone=''):
         start_trial(db,c)
         req=Request(telegram_id=tid,kind='trial',status='approved');req.decided_at=utcnow()
         db.add(req)
-        queue_recent_closed(db,tid,int(os.getenv('HISTORY_ON_ACTIVATION_COUNT','5')))
+        queue_recent_closed(db,tid,int(os.getenv('HISTORY_ON_ACTIVATION_COUNT','4')))
     who,_=_who(tid)
     _notify_admins(f'🎁 تم تفعيل تجربة مجانية تلقائيًا\nالعميل: {who}\nالـ ID: {tid}\nالرقم: +{phone}')
     return (f'🎉 تم تفعيل التجربة المجانية: ستصلك التوصيات حتى تحقيق {TRIAL_WINS} توصيات ناجحة '
@@ -506,7 +506,6 @@ def decide(actor,action,rid,days=None):
             # Subscription approval is a manual administrative attestation of external payment.
             bal=add_credits(db,req.telegram_id,days,f'request:{rid}',kind='purchase')
             req.status='approved'
-            queued_history=queue_recent_closed(db,req.telegram_id,int(os.getenv('HISTORY_ON_ACTIVATION_COUNT','5')))
             notice=(f'✅ تمت إضافة {_days(days)} إلى رصيدك في الصفوة. رصيدك الآن: {_days(bal)}.\n'
                     'ستصلك التوصيات الجديدة هنا فور صدورها. أهلًا بك 👑')
             admin_msg=f'✅ تمت إضافة {_days(days)} للعميل {req.telegram_id}. رصيده الآن: {_days(bal)}.'
@@ -629,6 +628,19 @@ def process(update):
                 except Exception:pass
             send(uid,f'✅ رصيد العميل {tid} الآن: {_days(bal)}.' if ok else f'⛔ تم إيقاف اشتراك العميل {tid}.')
             return
+        # الإدارة: /purge_replay ← حذف أحداث الإعادة/الاختبار القديمة اللي دخلت قاعدة البيانات بالغلط
+        if uid in ADMINS and cmd=='/purge_replay':
+            from sqlalchemy import delete
+            from common import is_replay
+            with Session.begin() as db:
+                bad=[e for e in db.scalars(select(Event)).all() if is_replay(e.payload)]
+                sids={e.signal_id for e in bad}
+                ids=[e.id for e in db.scalars(select(Event).where(Event.signal_id.in_(sids))).all()] if sids else []
+                if ids:
+                    db.execute(delete(Delivery).where(Delivery.event_id.in_(ids)))
+                    db.execute(delete(Event).where(Event.id.in_(ids)))
+                if sids:db.execute(delete(HistoricalDelivery).where(HistoricalDelivery.signal_id.in_(sids)))
+            send(uid,f'🧹 اتحذفت {len(sids)} توصية من الإعادات القديمة ({len(ids)} رسالة).');return
         # الإدارة: /reset <ID> ← حذف العميل بالكامل (بعد تأكيد)
         if uid in ADMINS and cmd=='/reset':
             p=text.split()

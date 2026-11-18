@@ -195,20 +195,23 @@ def grant(db, customer, days, kind):
 
 
 CLOSED_KINDS=('target2','stop','eod')
+REPLAY_MARKS=('Replay','replay_','أرشيف إعادة فحص','اختبار تاريخي')
 
-def queue_recent_closed(db, telegram_id, limit=5):
-    """Queue most recent distinct *closed* recommendations, never as live alerts.
 
-    Historical recommendations are delivered once per customer/signal even after renewal.
-    If there is no closed event stored yet, return 0 (no fabricated history).
-    """
+def is_replay(text):
+    """أحداث اتبعتت من إعادة/اختبار قديم مش من الماسح الحي — ما بتتعرضش للعملا."""
+    return any(m in (text or '') for m in REPLAY_MARKS)
+
+
+def queue_recent_closed(db, telegram_id, limit=4):
+    """آخر {limit} توصيات مغلقة حقيقية (من الماسح الحي) — للعرض بس — بالترتيب من الأقدم للأحدث."""
     endings=db.scalars(select(Event).where(Event.kind.in_(CLOSED_KINDS))
                        .order_by(Event.id.desc())).all()
-    added=0
+    picked=[]
     seen=set()
     for end in endings:
         sid=end.signal_id
-        if sid in seen: continue
+        if sid in seen or is_replay(end.payload): continue
         seen.add(sid)
         exists=db.scalar(select(HistoricalDelivery.id).where(
             HistoricalDelivery.telegram_id==telegram_id,
@@ -216,20 +219,22 @@ def queue_recent_closed(db, telegram_id, limit=5):
         if exists:continue
         opening=db.scalar(select(Event).where(Event.signal_id==sid,Event.kind=='open')
                           .order_by(Event.id.asc()).limit(1))
+        if not opening or is_replay(opening.payload):continue
+        picked.append((end,opening))
+        if len(picked)>=limit:break
+    added=0
+    for end,opening in reversed(picked):          # الأقدم الأول، والأحدث في الآخر
+        sid=end.signal_id
         parts=['📚 توصية مغلقة سابقة — للعرض فقط',
                '⚠️ ليست إشارة دخول جديدة',
                f'السهم: {end.symbol}',
                f'معرّف التوصية: {sid}']
-        if opening:parts.extend(['', '📈 إشارة الدخول الأصلية:', opening.payload])
+        parts.extend(['', '📈 إشارة الدخول الأصلية:', opening.payload])
         parts.extend(['', '🏁 آخر تحديث لإغلاق التوصية:', end.payload])
         content='\n'.join(parts)
         if len(content)>3900:
-            # Telegram max 4096; retain both the original signal and final status.
             header='\n'.join(parts[:4])
-            entry=(opening.payload[:1400] if opening else 'غير محفوظة')
-            final=end.payload[:1400]
-            content=f'{header}\n\n📈 إشارة الدخول الأصلية:\n{entry}\n\n🏁 آخر تحديث للإغلاق:\n{final}'
+            content=f'{header}\n\n📈 إشارة الدخول الأصلية:\n{opening.payload[:1400]}\n\n🏁 آخر تحديث للإغلاق:\n{end.payload[:1400]}'
         db.add(HistoricalDelivery(telegram_id=telegram_id,signal_id=sid,payload=content))
         added+=1
-        if added>=limit:break
     return added
