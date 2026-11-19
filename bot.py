@@ -120,6 +120,7 @@ KIND_AR={
     'open':'🟢 مفتوحة — لم تصل إلى هدف أو وقف بعد',
     'target1':'🎯 حققت الهدف الأول',
     'target2':'🎯🎯 حققت الهدف الثاني',
+    'breakeven':'🔒 حققت الهدف الأول ثم أُغلق الباقي على سعر الشراء',
     'stop':'⛔ ضربت وقف الخسارة',
     'eod':'🔔 تم إغلاقها نهاية اليوم دون هدف أو وقف',
     'activated':'🟢 تم تفعيلها — لم تصل إلى هدف أو وقف بعد',
@@ -336,7 +337,7 @@ def mine(tid):
             line=f'🔷 {last.symbol}\n{label}\n🗓️ {day}'
             if hhmm:line+=f' الساعة {hhmm} بتوقيت نيويورك'
             if price:line+=f' — سعر الشراء {price}'
-            pct=(_pct(last.payload) or _pct_from_levels(opened.payload if opened else '',last)) if last.kind in ('target1','target2','stop','eod') else None
+            pct=(_pct(last.payload) or _pct_from_levels(opened.payload if opened else '',last)) if last.kind in ('target1','target2','breakeven','stop','eod') else None
             if pct is not None:
                 line+=f'\n💵 العائد: {pct:+.2f}%'
                 rets.append(pct)

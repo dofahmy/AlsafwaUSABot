@@ -194,7 +194,7 @@ def grant(db, customer, days, kind):
     return customer.access_until
 
 
-CLOSED_KINDS=('target2','stop','eod')
+CLOSED_KINDS=('target2','breakeven','stop','eod')
 REPLAY_MARKS=('Replay','replay_','أرشيف إعادة فحص','اختبار تاريخي')
 
 
