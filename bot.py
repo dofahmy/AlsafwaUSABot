@@ -642,6 +642,19 @@ def process(update):
                     db.execute(delete(Event).where(Event.id.in_(ids)))
                 if sids:db.execute(delete(HistoricalDelivery).where(HistoricalDelivery.signal_id.in_(sids)))
             send(uid,f'🧹 اتحذفت {len(sids)} توصية من الإعادات القديمة ({len(ids)} رسالة).');return
+        # الإدارة: /queue ← حالة رسايل آخر توصيتين (اتبعتت ولا لأ ولمين)
+        if uid in ADMINS and cmd=='/queue':
+            with Session() as db:
+                evs=list(db.scalars(select(Event).order_by(Event.id.desc()).limit(6)).all())
+                lines=['📬 آخر الرسايل:']
+                for ev in evs:
+                    ds=list(db.scalars(select(Delivery).where(Delivery.event_id==ev.id)).all())
+                    st={}
+                    for d in ds:st[d.status]=st.get(d.status,0)+1
+                    lines.append(f'\n{ev.symbol} — {ev.kind}: '+(', '.join(f'{k} {v}' for k,v in st.items()) or 'لا أحد'))
+                    for d in ds:
+                        if d.status!='sent':lines.append(f'  {d.telegram_id}: {d.status} {(d.error or "")[:120]}')
+            send(uid,'\n'.join(lines)[:4000]);return
         # الإدارة: /reset <ID> ← حذف العميل بالكامل (بعد تأكيد)
         if uid in ADMINS and cmd=='/reset':
             p=text.split()
@@ -693,8 +706,13 @@ def deliver_historical():
                 row.sent_at=utcnow()
             time.sleep(.07)
         except Exception as exc:
-            LOG.warning('historical deliver %s failed: %s',hid,str(exc)[:100])
-            break
+            err=str(exc)[:300]
+            LOG.warning('historical deliver %s failed: %s',hid,err[:150])
+            if any(x in err for x in (' 403 ',' 400 ','blocked','chat not found','deactivated')):
+                with Session.begin() as db:
+                    db.get(HistoricalDelivery,hid).status='failed'
+            elif ' 429 ' in err:
+                break
 
 def deliver():
     with Session() as db:
@@ -713,9 +731,16 @@ def deliver():
                 row=write.get(Delivery,did);row.status='sent';row.sent_at=utcnow()
             time.sleep(.07)
         except Exception as e:
-            LOG.warning('deliver %s: %s',did,str(e)[:100])
-            # Retry later: no at-most-once guarantee if Telegram accepted just before timeout.
-            break
+            err=str(e)[:300]
+            LOG.warning('deliver %s to %s: %s',did,d.telegram_id,err[:150])
+            # عميل حاظر البوت أو المحادثة مش موجودة ← نهائي، علشان ما يوقفش الطابور لباقي العملاء
+            permanent=any(x in err for x in (' 403 ',' 400 ','blocked','chat not found','deactivated'))
+            with Session.begin() as write:
+                row=write.get(Delivery,did);row.error=err
+                if permanent:row.status='failed'
+            if not permanent and ' 429 ' in err:
+                break                       # تيليجرام طالب نستنى
+            continue
 
 def main():
     if not os.getenv('CUSTOMER_BOT_TOKEN'):raise RuntimeError('Set CUSTOMER_BOT_TOKEN')
