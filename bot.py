@@ -753,6 +753,8 @@ def main():
     except Exception:LOG.exception('Cannot set bot commands')
     offset=None
     last_check=0
+    short_until=0        # لما تيليجرام يرجّع 502 في الانتظار الطويل، نسأل كل ثانية بدل ما نستنى
+    fails=0
     while True:
         try:
             if time.time()-last_check>=60:
@@ -761,11 +763,22 @@ def main():
                 except Exception:LOG.exception('expiry check failed')
             deliver_historical()
             deliver()
-            updates=call('getUpdates',{'offset':offset,'timeout':10,'allowed_updates':['message','callback_query']},timeout=20)
+            short=time.time()<short_until
+            updates=call('getUpdates',{'offset':offset,'timeout':0 if short else 10,
+                                       'allowed_updates':['message','callback_query']},timeout=8 if short else 20)
+            if fails:
+                LOG.warning('Telegram polling back after %s failures',fails);fails=0
             for u in updates:
                 offset=u['update_id']+1
                 try:process(u)
                 except Exception:LOG.exception('Failed to process update')
-        except Exception:
-            LOG.exception('Polling error');time.sleep(3)
+            if short and not updates:time.sleep(1)
+        except Exception as e:
+            fails+=1
+            msg=str(e)[:160]
+            if any(c in msg for c in (' 502 ',' 503 ',' 504 ','timed out','Timeout','Connection')):
+                short_until=time.time()+600          # ١٠ دقايق انتظار قصير
+            if fails==1 or fails%30==0:
+                LOG.warning('Polling error (%s): %s',fails,msg)
+            time.sleep(1 if fails<5 else 3)
 if __name__=='__main__': main()
