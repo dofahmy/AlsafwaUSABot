@@ -353,39 +353,85 @@ def mine(tid):
         return '📊 نتائج توصياتك:\n\n'+'\n\n'.join(out)+tail
 
 
+def _status(db,sid):
+    """(حدث التوصية، آخر حالة، النسبة) لتوصية واحدة."""
+    evs=db.scalars(select(Event).where(Event.signal_id==sid).order_by(Event.id)).all()
+    opened=next((e for e in evs if e.kind=='open'),None)
+    if not opened:return None,None,None
+    last=next((e for e in reversed(evs) if e.kind in KIND_AR),opened)
+    pct=(_pct(last.payload) or _pct_from_levels(opened.payload,last)) if last.kind in ('target1','target2','breakeven','stop','eod') else None
+    return opened,last,pct
+
+
+SHORT_AR={'target2':'🎯🎯 الهدف الثاني','breakeven':'🔒 الهدف الأول ثم سعر الشراء','stop':'⛔ وقف الخسارة',
+          'eod':'🔔 أُغلقت نهاية اليوم','cancelled':'🚫 ملغية لعدم التفعيل'}
+
+
 def mine_today(tid):
-    """توصيات آخر جلسة بالتفاصيل الكاملة (زي ما اتبعتت) + حالتها دلوقتي — لو العميل مسح المحادثة."""
+    """رسالة واحدة: توصيات آخر جلسة (المفتوح بأرقامه، والمنتهي بنتيجته) + زرار لكل سهم يفتح تفاصيله."""
+    from common import is_replay
     with Session() as db:
         c=db.get(Customer,tid)
         if not active(c):return 'التوصيات الخاصة متاحة للمشتركين النشطين فقط.'
         ids=list(db.scalars(select(Event.signal_id).join(Delivery,Delivery.event_id==Event.id)
                      .where(Delivery.telegram_id==tid,Event.kind=='open',Delivery.status=='sent')
                      .order_by(Event.id.desc()).limit(40)).all())
-        from common import is_replay
-        ids=[i for i in ids if not is_replay(i)]
         if not ids:return 'لا توجد توصيات مستلمة على حسابك حتى الآن.'
         day=max(i.split(':')[0] for i in ids)
         todays=sorted({i for i in ids if i.startswith(day)},key=lambda x:x.split(':')[2:4])
-        msgs=[]
+        syms=[i.split(':')[1] for i in todays]
+        opens,closed,buttons=[],[],[]
         for sid in todays:
-            evs=db.scalars(select(Event).where(Event.signal_id==sid).order_by(Event.id)).all()
-            opened=next((e for e in evs if e.kind=='open'),None)
-            if not opened:continue
-            last=next((e for e in reversed(evs) if e.kind in KIND_AR),opened)
-            label=KIND_AR.get(last.kind,last.kind)
-            if last.kind=='open' and '⏳' in (opened.payload or ''):
-                label='⏳ في انتظار التفعيل — لم ينزل السعر إلى سعر الشراء بعد'
-            pct=(_pct(last.payload) or _pct_from_levels(opened.payload,last)) if last.kind in ('target1','target2','breakeven','stop','eod') else None
-            status=f'\n\n📌 الحالة الآن: {label}'+(f' ({pct:+.2f}%)' if pct is not None else '')
-            msgs.append((opened.payload or '')+status)
+            opened,last,pct=_status(db,sid)
+            if not opened or is_replay(opened.payload):continue
+            sym=sid.split(':')[1];hhmm=':'.join(sid.split(':')[2:4])
+            name=f'{sym} {hhmm}' if syms.count(sym)>1 else sym
+            buttons.append({'text':name,'callback_data':f'sig:{sid}'[:64]})
+            k=last.kind
+            if k in SHORT_AR:
+                closed.append(f'🔷 {name} — {SHORT_AR[k]}'+(f' ({pct:+.2f}%)' if pct is not None else ''))
+                continue
+            o=opened.payload
+            import re
+            g=lambda pat:(re.search(pat+r':\s*([0-9.]+)',o or '') or [None,None])[1]
+            e,t1,t2,sl=g(r'سعر (?:الدخول|الشراء)'),g('الهدف الأول'),g('الهدف الثاني'),g('وقف الخسارة')
+            f=lambda x:x or '—'
+            if k=='target1':
+                line=f'🔷 {name} — 🎯 حقق الهدف الأول ({pct:+.2f}%)\n     الباقي: هدف {f(t2)} | الوقف عند الشراء {f(e)}' if pct is not None else \
+                     f'🔷 {name} — 🎯 حقق الهدف الأول\n     الباقي: هدف {f(t2)} | الوقف عند الشراء {f(e)}'
+            else:
+                wait=' ⏳ بانتظار التفعيل' if (k=='open' and '⏳' in (o or '')) else ''
+                line=f'🔷 {name} — شراء {f(e)} | هدف {f(t1)} / {f(t2)} | وقف {f(sl)}{wait}'
+            opens.append(line)
     try:d=datetime.strptime(day,'%Y-%m-%d').strftime('%d/%m')
     except Exception:d=day
-    send(tid,f'📈 توصيات جلسة {d} ({len(msgs)}):')
-    for m in msgs:
-        try:send(tid,m[:4000])
-        except Exception:LOG.exception('today send failed')
-    send(tid,'اختر من القائمة:',MAIN_MENU)
+    n=len(opens)+len(closed)
+    parts=[f'📈 توصيات جلسة {d} — {_count(n,"توصية","توصيات")}']
+    if opens:parts.append('🟢 مفتوحة الآن:\n'+'\n'.join(opens))
+    if closed:parts.append('✅ انتهت:\n'+'\n'.join(closed))
+    parts.append('اضغط على أي سهم لعرض التوصية كاملة 👇')
+    kb=[buttons[i:i+3] for i in range(0,len(buttons),3)]+[[{'text':'⬅️ القائمة','callback_data':'menu'}]]
+    send(tid,'\n\n'.join(parts)[:4000],kb)
     return None
+
+
+def show_signal(tid,sid):
+    """التوصية كاملة بشكلها الأصلي + حالتها دلوقتي."""
+    with Session() as db:
+        c=db.get(Customer,tid)
+        if not active(c):return 'التوصيات الخاصة متاحة للمشتركين النشطين فقط.'
+        got=db.scalar(select(Delivery.id).join(Event,Event.id==Delivery.event_id)
+                      .where(Delivery.telegram_id==tid,Event.signal_id==sid,Event.kind=='open'))
+        if not got:return 'هذه التوصية غير متاحة على حسابك.'
+        opened,last,pct=_status(db,sid)
+        if not opened:return 'لم أجد هذه التوصية.'
+        label=KIND_AR.get(last.kind,last.kind)
+        if last.kind=='open' and '⏳' in (opened.payload or ''):
+            label='⏳ في انتظار التفعيل — لم ينزل السعر إلى سعر الشراء بعد'
+        text=(opened.payload or '')+f'\n\n📌 الحالة الآن: {label}'+(f' ({pct:+.2f}%)' if pct is not None else '')
+    send(tid,text[:4000],[[{'text':'⬅️ توصياتي اليوم','callback_data':'today'}]])
+    return None
+
 
 def _who(tid):
     with Session() as db:
@@ -575,6 +621,8 @@ def interact(uid,username,data):
     if data=='request:subscription':return submit_request(uid,'subscription')
     if data=='mine':return mine(uid)
     if data=='today':return mine_today(uid)
+    if data.startswith('sig:'):return show_signal(uid,data[4:])
+    if data=='menu':send(uid,'اختر من القائمة:',MAIN_MENU);return None
     if data=='perf':return 'تم إلغاء هذه الخدمة.'
     if data=='account':return account(uid)
     return 'اختر من القائمة.'
