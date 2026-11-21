@@ -70,15 +70,17 @@ def send_buy(uid):
     send(uid,f'💳 باقة {PACKAGE_SIZE} توصيات — {price} دولار\nيمكنك شراء أكثر من باقة، ويُضاف رصيدها تلقائيًا بعد الدفع.\n'
              'اضغط الزر التالي لإتمام الدفع بأمان عبر Whop.',[[{'text':'💳 ادفع الآن','url':url}]])
 MAIN_MENU=[[{'text':f'🎁 تجربة مجانية ({TRIAL_WINS} توصيات ناجحة)','callback_data':'request:trial'}, SUBSCRIBE_BTN],
-           [{'text':'📈 توصياتي','callback_data':'mine'}, {'text':'👤 حسابي','callback_data':'account'}],
-           [{'text':'☀️ نظرة قبل الافتتاح','callback_data':'pre'}, {'text':'🎧 خدمة العملاء','callback_data':'contact'}]]
+           [{'text':'📈 توصياتي اليوم','callback_data':'today'}, {'text':'📊 نتائج توصياتي','callback_data':'mine'}],
+           [{'text':'☀️ نظرة قبل الافتتاح','callback_data':'pre'}, {'text':'👤 حسابي','callback_data':'account'}],
+           [{'text':'🎧 خدمة العملاء','callback_data':'contact'}]]
 
 # قائمة الأوامر (زرار Menu جنب خانة الكتابة) — بتتسجل في تيليجرام أول ما البوت يشتغل
 BOT_COMMANDS=[
     {'command':'start','description':'بدء الاستخدام'},
     {'command':'trial','description':'تفعيل التجربة المجانية'},
     {'command':'subscribe','description':'الاشتراك الآن'},
-    {'command':'mine','description':'توصياتي'},
+    {'command':'today','description':'توصياتي اليوم'},
+    {'command':'mine','description':'نتائج توصياتي'},
     {'command':'account','description':'بيانات اشتراكي'},
     {'command':'premarket','description':'نظرة قبل الافتتاح'},
     {'command':'contact','description':'خدمة العملاء'},
@@ -157,6 +159,7 @@ def _pct_from_levels(open_text,ev):
     if ev.kind=='target1':p=_num(r'الهدف الأول:\s*([0-9.]+)',open_text)
     elif ev.kind=='target2':p=_num(r'الهدف الثاني:\s*([0-9.]+)',open_text)
     elif ev.kind=='stop':p=_num(r'وقف الخسارة:\s*([0-9.]+)',open_text)
+    elif ev.kind=='breakeven':p=_num(r'الهدف الأول:\s*([0-9.]+)',open_text)   # بيتحسب على الهدف الأول
     else:p=_num(r'آخر سعر\s*([0-9.]+)',ev.payload)
     return round((p/entry-1)*100,2) if p else None
 
@@ -347,7 +350,42 @@ def mine(tid):
             wins=sum(r>0 for r in rets)
             tail=(f'\n\n📊 التوصيات المنتهية: {len(rets)} — الرابحة منها: {wins}'
                   f'\nمتوسط العائد: {sum(rets)/len(rets):+.2f}%')
-        return 'آخر توصيات حسابك:\n\n'+'\n\n'.join(out)+tail
+        return '📊 نتائج توصياتك:\n\n'+'\n\n'.join(out)+tail
+
+
+def mine_today(tid):
+    """توصيات آخر جلسة بالتفاصيل الكاملة (زي ما اتبعتت) + حالتها دلوقتي — لو العميل مسح المحادثة."""
+    with Session() as db:
+        c=db.get(Customer,tid)
+        if not active(c):return 'التوصيات الخاصة متاحة للمشتركين النشطين فقط.'
+        ids=list(db.scalars(select(Event.signal_id).join(Delivery,Delivery.event_id==Event.id)
+                     .where(Delivery.telegram_id==tid,Event.kind=='open',Delivery.status=='sent')
+                     .order_by(Event.id.desc()).limit(40)).all())
+        from common import is_replay
+        ids=[i for i in ids if not is_replay(i)]
+        if not ids:return 'لا توجد توصيات مستلمة على حسابك حتى الآن.'
+        day=max(i.split(':')[0] for i in ids)
+        todays=sorted({i for i in ids if i.startswith(day)},key=lambda x:x.split(':')[2:4])
+        msgs=[]
+        for sid in todays:
+            evs=db.scalars(select(Event).where(Event.signal_id==sid).order_by(Event.id)).all()
+            opened=next((e for e in evs if e.kind=='open'),None)
+            if not opened:continue
+            last=next((e for e in reversed(evs) if e.kind in KIND_AR),opened)
+            label=KIND_AR.get(last.kind,last.kind)
+            if last.kind=='open' and '⏳' in (opened.payload or ''):
+                label='⏳ في انتظار التفعيل — لم ينزل السعر إلى سعر الشراء بعد'
+            pct=(_pct(last.payload) or _pct_from_levels(opened.payload,last)) if last.kind in ('target1','target2','breakeven','stop','eod') else None
+            status=f'\n\n📌 الحالة الآن: {label}'+(f' ({pct:+.2f}%)' if pct is not None else '')
+            msgs.append((opened.payload or '')+status)
+    try:d=datetime.strptime(day,'%Y-%m-%d').strftime('%d/%m')
+    except Exception:d=day
+    send(tid,f'📈 توصيات جلسة {d} ({len(msgs)}):')
+    for m in msgs:
+        try:send(tid,m[:4000])
+        except Exception:LOG.exception('today send failed')
+    send(tid,'اختر من القائمة:',MAIN_MENU)
+    return None
 
 def _who(tid):
     with Session() as db:
@@ -536,6 +574,7 @@ def interact(uid,username,data):
     if data=='request:trial':return submit_request(uid,'trial')
     if data=='request:subscription':return submit_request(uid,'subscription')
     if data=='mine':return mine(uid)
+    if data=='today':return mine_today(uid)
     if data=='perf':return 'تم إلغاء هذه الخدمة.'
     if data=='account':return account(uid)
     return 'اختر من القائمة.'
@@ -592,9 +631,9 @@ def process(update):
             send_buy(uid);return
         if cmd=='/subscribe' and WHOP_CHECKOUT_URL:
             send(uid,'💳 اضغط الزر التالي لإتمام الاشتراك والدفع بأمان عبر Whop.',subscribe_kb());return
-        if cmd in ('/trial','/subscribe','/mine','/account'):
+        if cmd in ('/trial','/subscribe','/mine','/today','/account'):
             r={'/trial':lambda:request_trial(uid),'/subscribe':lambda:subscribe_now(uid),
-               '/mine':lambda:mine(uid),'/account':lambda:account(uid)}[cmd]()
+               '/mine':lambda:mine(uid),'/today':lambda:mine_today(uid),'/account':lambda:account(uid)}[cmd]()
             if r is not None:send(uid,r,MAIN_MENU)
             return
         if cmd=='/premarket':send_premarket(uid);return
