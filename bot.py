@@ -69,20 +69,21 @@ def send_buy(uid):
     price=os.getenv('PACKAGE_PRICE','50')
     send(uid,f'💳 باقة {PACKAGE_SIZE} توصيات — {price} دولار\nيمكنك شراء أكثر من باقة، ويُضاف رصيدها تلقائيًا بعد الدفع.\n'
              'اضغط الزر التالي لإتمام الدفع بأمان عبر Whop.',[[{'text':'💳 ادفع الآن','url':url}]])
-MAIN_MENU=[[{'text':f'🎁 تجربة مجانية ({TRIAL_WINS} توصيات ناجحة)','callback_data':'request:trial'}, SUBSCRIBE_BTN],
+MAIN_MENU=[[{'text':'☀️ نظرة قبل الافتتاح','callback_data':'pre'}],
            [{'text':'📈 توصياتي اليوم','callback_data':'today'}, {'text':'📊 نتائج توصياتي','callback_data':'mine'}],
-           [{'text':'☀️ نظرة قبل الافتتاح','callback_data':'pre'}, {'text':'👤 حسابي','callback_data':'account'}],
+           [{'text':f'🎁 تجربة مجانية ({TRIAL_WINS} توصيات ناجحة)','callback_data':'request:trial'}, SUBSCRIBE_BTN],
+           [{'text':'👤 حسابي','callback_data':'account'}],
            [{'text':'🎧 خدمة العملاء','callback_data':'contact'}]]
 
 # قائمة الأوامر (زرار Menu جنب خانة الكتابة) — بتتسجل في تيليجرام أول ما البوت يشتغل
 BOT_COMMANDS=[
     {'command':'start','description':'بدء الاستخدام'},
-    {'command':'trial','description':'تفعيل التجربة المجانية'},
-    {'command':'subscribe','description':'الاشتراك الآن'},
+    {'command':'premarket','description':'نظرة قبل الافتتاح'},
     {'command':'today','description':'توصياتي اليوم'},
     {'command':'mine','description':'نتائج توصياتي هذا الشهر'},
+    {'command':'trial','description':'تفعيل التجربة المجانية'},
+    {'command':'subscribe','description':'الاشتراك الآن'},
     {'command':'account','description':'بيانات اشتراكي'},
-    {'command':'premarket','description':'نظرة قبل الافتتاح'},
     {'command':'contact','description':'خدمة العملاء'},
 ]
 SUPPORT_USERNAME=os.getenv('SUPPORT_USERNAME','').lstrip('@')
