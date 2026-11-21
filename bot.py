@@ -80,7 +80,7 @@ BOT_COMMANDS=[
     {'command':'trial','description':'تفعيل التجربة المجانية'},
     {'command':'subscribe','description':'الاشتراك الآن'},
     {'command':'today','description':'توصياتي اليوم'},
-    {'command':'mine','description':'نتائج توصياتي'},
+    {'command':'mine','description':'نتائج توصياتي هذا الشهر'},
     {'command':'account','description':'بيانات اشتراكي'},
     {'command':'premarket','description':'نظرة قبل الافتتاح'},
     {'command':'contact','description':'خدمة العملاء'},
@@ -314,43 +314,60 @@ def send_premarket(uid):
         LOG.exception('premarket photo failed');send(uid,cap,MAIN_MENU)
 
 
+AR_MONTHS=['يناير','فبراير','مارس','أبريل','مايو','يونيو','يوليو','أغسطس','سبتمبر','أكتوبر','نوفمبر','ديسمبر']
+
+
 def mine(tid):
+    """نتائج توصيات العميل في الشهر الحالي، بنفس شكل الحصاد: يوم بيوم + ملخص."""
+    from common import is_replay
+    from zoneinfo import ZoneInfo
+    now=datetime.now(ZoneInfo('America/New_York'))
+    month=now.strftime('%Y-%m')
     with Session() as db:
         c=db.get(Customer,tid)
         if not active(c):return 'التوصيات الخاصة متاحة للمشتركين النشطين فقط.'
         ids=list(db.scalars(select(Event.signal_id).join(Delivery,Delivery.event_id==Event.id)
-                     .where(Delivery.telegram_id==tid,Event.kind=='open',Delivery.status=='sent')
-                     .order_by(Event.id.desc()).limit(15)).all())
-        if not ids:return 'لا توجد توصيات خاصة مستلمة على حسابك حتى الآن.'
-        out,rets=[],[]
-        for sid in ids[:10]:
-            evs=db.scalars(select(Event).where(Event.signal_id==sid).order_by(Event.id.desc())).all()
-            if not evs:continue
-            last=next((e for e in evs if e.kind in KIND_AR),evs[0])        # آخر حالة (من غير رسايل التنبيه)
-            opened=next((e for e in evs if e.kind=='open'),None)
-            parts=sid.split(':')
-            day=parts[0] if parts else ''
-            hhmm=':'.join(parts[2:4]) if len(parts)>=4 else ''
-            try:day=datetime.strptime(day,'%Y-%m-%d').strftime('%d/%m')
-            except Exception:pass
-            price=_entry_price(opened.payload if opened else '')
-            label=KIND_AR.get(last.kind,last.kind)
-            if last.kind=='open' and '⏳' in (last.payload or ''):
-                label='⏳ في انتظار التفعيل — لم ينزل السعر إلى سعر الشراء بعد'
-            line=f'🔷 {last.symbol}\n{label}\n🗓️ {day}'
-            if hhmm:line+=f' الساعة {hhmm} بتوقيت نيويورك'
-            if price:line+=f' — سعر الشراء {price}'
-            pct=(_pct(last.payload) or _pct_from_levels(opened.payload if opened else '',last)) if last.kind in ('target1','target2','breakeven','stop','eod') else None
-            if pct is not None:
-                line+=f'\n💵 العائد: {pct:+.2f}%'
-                rets.append(pct)
-            out.append(line)
-        tail=''
-        if rets:
-            wins=sum(r>0 for r in rets)
-            tail=(f'\n\n📊 التوصيات المنتهية: {len(rets)} — الرابحة منها: {wins}'
-                  f'\nمتوسط العائد: {sum(rets)/len(rets):+.2f}%')
-        return '📊 نتائج توصياتك:\n\n'+'\n\n'.join(out)+tail
+                     .where(Delivery.telegram_id==tid,Event.kind=='open',Delivery.status=='sent',
+                            Event.signal_id.like(f'{month}-%'))).all())
+        rows=[]
+        for sid in sorted(set(ids),key=lambda x:(x.split(':')[0],x.split(':')[2:4])):
+            opened,last,pct=_status(db,sid)
+            if not opened or is_replay(opened.payload):continue
+            rows.append((sid,last.kind,pct))
+    title=f'📊 نتائج توصياتك — {AR_MONTHS[now.month-1]} {now.year}'
+    if not rows:return title+'\n\nلا توجد توصيات على حسابك هذا الشهر حتى الآن.'
+    rank={'target2':0,'breakeven':1,'target1':1,'eod':2,'stop':3,'cancelled':5}
+    w=l=0;rets=[];blocks=[]
+    days=sorted({r[0].split(':')[0] for r in rows})
+    for d in days:
+        day_rows=[r for r in rows if r[0].startswith(d)]
+        syms=[r[0].split(':')[1] for r in day_rows]
+        lines=[]
+        for sid,k,pct in sorted(day_rows,key=lambda r:(rank.get(r[1],4),r[0].split(':')[2:4])):
+            sym=sid.split(':')[1];name=f"{sym} {':'.join(sid.split(':')[2:4])}" if syms.count(sym)>1 else sym
+            p=f' ({pct:+.1f}%)' if pct is not None else ''
+            if k=='target2':lines.append(f'✅ {name} — الهدف الثاني{p}');w+=1
+            elif k in ('target1','breakeven'):lines.append(f'✅ {name} — الهدف الأول{p}');w+=1
+            elif k=='stop':lines.append(f'❌ {name} — وقف خسارة{p}');l+=1
+            elif k=='eod':lines.append(f'🔔 {name} — تم إغلاقها نهاية اليوم دون هدف أو وقف{p}')
+            elif k=='cancelled':lines.append(f'🚫 {name} — ملغية لعدم تفعيل سعر الشراء');continue
+            else:lines.append(f'⏳ {name} — لم تصل إلى هدف أو وقف بعد');continue
+            if pct is not None:rets.append(pct)
+        try:dd=datetime.strptime(d,'%Y-%m-%d').strftime('%d/%m')
+        except Exception:dd=d
+        blocks.append(f'🗓️ {dd}\n'+'\n'.join(lines))
+    summary=[]
+    if w+l:summary.append(f'نسبة النجاح: {w/(w+l):.0%} ({w} من {w+l})')
+    if rets:summary.append(f'متوسط العائد: {sum(rets)/len(rets):+.2f}%')
+    text=title+'\n\n'+'\n\n'.join(blocks)+('\n\n'+'\n'.join(summary) if summary else '')
+    if len(text)<=4000:return text
+    # الشهر طويل: نبعته على كذا رسالة والملخص في الآخر
+    chunk=title
+    for b in blocks:
+        if len(chunk)+len(b)+2>3900:
+            send(tid,chunk);chunk=''
+        chunk+=('\n\n' if chunk else '')+b
+    return chunk+('\n\n'+'\n'.join(summary) if summary else '')
 
 
 def _status(db,sid):
