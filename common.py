@@ -204,7 +204,7 @@ def is_replay(text):
 
 
 def queue_recent_closed(db, telegram_id, limit=4):
-    """آخر {limit} توصيات مغلقة حقيقية (من الماسح الحي) — للعرض بس — بالترتيب من الأقدم للأحدث."""
+    """آخر {limit} توصيات مغلقة ناجحة (وصلت للهدف الأول على الأقل) من الماسح الحي — للعرض بس — من الأقدم للأحدث."""
     endings=db.scalars(select(Event).where(Event.kind.in_(CLOSED_KINDS))
                        .order_by(Event.id.desc())).all()
     picked=[]
@@ -220,6 +220,9 @@ def queue_recent_closed(db, telegram_id, limit=4):
         opening=db.scalar(select(Event).where(Event.signal_id==sid,Event.kind=='open')
                           .order_by(Event.id.asc()).limit(1))
         if not opening or is_replay(opening.payload):continue
+        # ناجحة بس: وصلت للهدف الأول على الأقل (من غير وقف الخسارة ولا اللي اتقفلت آخر اليوم من غير هدف)
+        hit=db.scalar(select(Event.id).where(Event.signal_id==sid,Event.kind.in_(('target1','target2'))).limit(1))
+        if not hit:continue
         picked.append((end,opening))
         if len(picked)>=limit:break
     added=0

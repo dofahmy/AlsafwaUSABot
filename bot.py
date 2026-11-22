@@ -71,7 +71,7 @@ def send_buy(uid):
              'اضغط الزر التالي لإتمام الدفع بأمان عبر Whop.',[[{'text':'💳 ادفع الآن','url':url}]])
 MAIN_MENU=[[{'text':'☀️ نظرة قبل الافتتاح','callback_data':'pre'}],
            [{'text':'📈 توصياتي اليوم','callback_data':'today'}, {'text':'📊 نتائج توصياتي','callback_data':'mine'}],
-           [{'text':f'🎁 تجربة مجانية ({TRIAL_WINS} توصيات ناجحة)','callback_data':'request:trial'}, SUBSCRIBE_BTN],
+           [SUBSCRIBE_BTN],
            [{'text':'👤 حسابي','callback_data':'account'}],
            [{'text':'🎧 خدمة العملاء','callback_data':'contact'}]]
 
@@ -81,7 +81,6 @@ BOT_COMMANDS=[
     {'command':'premarket','description':'نظرة قبل الافتتاح'},
     {'command':'today','description':'توصياتي اليوم'},
     {'command':'mine','description':'نتائج توصياتي هذا الشهر'},
-    {'command':'trial','description':'تفعيل التجربة المجانية'},
     {'command':'subscribe','description':'الاشتراك الآن'},
     {'command':'account','description':'بيانات اشتراكي'},
     {'command':'contact','description':'خدمة العملاء'},
@@ -97,7 +96,7 @@ BOT_DESCRIPTION="""👑 الصفوة | توصيات لحظية على الأسه
 🛡️ مستوى مخاطرة مع كل توصية وإدارة واضحة للمراكز
 
 🎁 تجربة مجانية حتى تحقيق 5 توصيات ناجحة
-اضغط «ابدأ» وفعّل تجربتك الآن"""
+اضغط «ابدأ» وتبدأ تجربتك المجانية فورًا"""
 # السطر اللي بيظهر في صفحة البوت (About) ولما حد يشارك البوت
 BOT_SHORT_DESCRIPTION="توصيات لحظية على الأسهم الأمريكية بأهداف ووقف خسارة واضح — جرّبها مجانًا حتى 5 توصيات ناجحة"   # يوزر حساب خدمة العملاء (اختياري)
 
@@ -111,7 +110,7 @@ def account(tid):
     with Session() as db:
         cr=db.get(Credit,tid)
         if not cr or not eligible(db,tid):
-            return 'حالة الاشتراك: غير نشط. يمكنك بدء التجربة المجانية أو الاشتراك من القائمة.'
+            return 'حالة الاشتراك: غير نشط. يمكنك الاشتراك من «💳 اشترك الآن».'
         lines=['👤 بيانات اشتراكك']
         if cr.balance>0:lines.append(f'💳 رصيدك: {_count(cr.balance,"توصية","توصيات")}')
         if cr.mode=='trial' and cr.trial_wins<TRIAL_WINS:
@@ -175,11 +174,16 @@ def _fmt_day(d):
     return d.strftime('%d/%m')
 
 
-EXPIRED_COMMANDS=[{'command':'start','description':'بدء الاستخدام'},{'command':'subscribe','description':'اشترك الآن'}]
+EXPIRED_COMMANDS=[{'command':'subscribe','description':'اشترك الآن'},{'command':'contact','description':'خدمة العملاء'}]
 
 
 def subscribe_kb():
     return [[SUBSCRIBE_BTN]]
+
+
+def expired_kb():
+    """العميل اللي تجربته أو رصيده خلص: زرار الاشتراك وزرار خدمة العملاء بس."""
+    return [[SUBSCRIBE_BTN]]+support_kb()
 
 
 def support_kb():
@@ -232,10 +236,9 @@ def check_expiries():
         try:send(tid,'✅ تمت إضافة رصيد إلى حسابك، وستصلك التوصيات الجديدة فور صدورها.',MAIN_MENU)
         except Exception:pass
     for tid,paid in ended:
-        msg=('انتهى رصيدك من التوصيات. يسعدنا استمرارك معنا؛ اضغط «اشترك الآن» لإضافة باقة جديدة.' if paid else
-             'انتهت فترتك التجريبية. يسعدنا انضمامك إلى مشتركي الصفوة؛ اضغط «اشترك الآن» لإتمام الاشتراك.')
-        try:send(tid,msg,subscribe_kb())
-        except Exception:LOG.warning('expiry notice to %s failed',tid)
+        if paid:                       # التجربة لما تخلص: مفيش ولا رسالة للعميل
+            try:send(tid,'انتهى رصيدك من التوصيات. يسعدنا استمرارك معنا؛ اضغط «اشترك الآن» لإضافة باقة جديدة.',expired_kb())
+            except Exception:LOG.warning('expiry notice to %s failed',tid)
         set_expired_commands(tid,True)
         who,_=_who(tid)
         _notify_admins(f'⏰ {"انتهى رصيد" if paid else "انتهت تجربة"} العميل {who} (ID: {tid})')
@@ -295,10 +298,10 @@ def contact(uid):
     expired=expired_state(uid)
     if SUPPORT_USERNAME:
         send(uid,'للتواصل مع خدمة عملاء الصفوة، اضغط الزر التالي لفتح المحادثة مع ممثلنا.',
-             support_kb()+([] if expired else MAIN_MENU))
+             ([[SUBSCRIBE_BTN]]+support_kb()) if expired else support_kb()+MAIN_MENU)
     else:
         send(uid,'🎧 خدمة العملاء\nاكتب رسالتك هنا مباشرة وسيتم تحويلها إلى فريق الصفوة، وسنرد عليك في أقرب وقت.',
-             None if expired else MAIN_MENU)
+             [[SUBSCRIBE_BTN]] if expired else MAIN_MENU)
 
 
 def send_premarket(uid):
@@ -520,6 +523,45 @@ def request_trial(tid):
     return auto_trial(tid,phone)
 
 
+def start_trial_now(tid):
+    """تفعيل التجربة تلقائيًا (من غير رقم موبايل) لأي عميل عمره ما بدأها. بيرجّع True لو اتفعّلت دلوقتي."""
+    if tid in ADMINS:return False
+    with Session.begin() as db:
+        c=db.get(Customer,tid)
+        if not c or c.trial_used or eligible(db,tid):return False
+        cr=db.get(Credit,tid)
+        if cr and cr.mode!='none':return False
+        start_trial(db,c)
+        req=Request(telegram_id=tid,kind='trial',status='approved');req.decided_at=utcnow()
+        db.add(req)
+        queue_recent_closed(db,tid,int(os.getenv('HISTORY_ON_ACTIVATION_COUNT','4')))
+    set_expired_commands(tid,False)
+    who,_=_who(tid)
+    _notify_admins(f'🎁 تجربة مجانية اتفعّلت تلقائيًا\nالعميل: {who}\nالـ ID: {tid}')
+    return True
+
+
+WELCOME_TRIAL=(f'أهلًا بك في الصفوة 👑\n'
+               f'🎁 تم تفعيل تجربتك المجانية تلقائيًا: ستصلك التوصيات هنا فور صدورها حتى تحقيق {TRIAL_WINS} توصيات ناجحة '
+               '(التوصية الناجحة = وصلت للهدف الأول).')
+
+
+def backfill_trials():
+    """مرة واحدة عند التشغيل: أي عميل موجود عمره ما بدأ التجربة ← تتفعّل له ونبلّغه."""
+    with Session() as db:
+        ids=[c.telegram_id for c in db.scalars(select(Customer).where(Customer.trial_used==False)).all()]
+    n=0
+    for tid in ids:
+        try:
+            if start_trial_now(tid):
+                n+=1
+                try:send(tid,WELCOME_TRIAL,MAIN_MENU)
+                except Exception:LOG.warning('trial welcome to %s failed',tid)
+                time.sleep(0.05)
+        except Exception:LOG.exception('backfill trial %s failed',tid)
+    if n:LOG.warning('Auto trial: activated for %s existing customers',n)
+
+
 def auto_trial(tid,phone=''):
     """تفعيل التجربة (بعد التحقق من الرقم)، مرة واحدة بس لكل حساب ولكل رقم."""
     with Session.begin() as db:
@@ -635,7 +677,7 @@ def interact(uid,username,data):
     if data.startswith('reset:') and uid in ADMINS:
         tid=int(data.split(':',1)[1])
         return f'🗑️ تم حذف العميل {tid} بالكامل. يقدر يبدأ من الأول كأنه جديد.' if reset_customer(tid) else 'العميل غير موجود.'
-    if data=='request:trial':return submit_request(uid,'trial')
+    if data=='request:trial':return 'تجربتك المجانية مفعّلة تلقائيًا ✅'
     if data=='request:subscription':return submit_request(uid,'subscription')
     if data=='mine':return mine(uid)
     if data=='today':return mine_today(uid)
@@ -652,21 +694,27 @@ def process(update):
     who_id=(cb or {}).get('from',{}).get('id') or ((msg or {}).get('from') or {}).get('id')
     if who_id and (cb or (msg and msg['chat']['type']=='private')):
         ensure_user(who_id,((cb or msg).get('from') or {}).get('username',''))
+        if start_trial_now(who_id):                         # أول دخول: التجربة بتتفعّل لوحدها
+            send(who_id,WELCOME_TRIAL,MAIN_MENU)
+            if msg and ((msg.get('text') or '').strip().split('@')[0].lower() in ('/start','')):
+                return
         state=expired_state(who_id)
         if state:
             if cb:call('answerCallbackQuery',{'callback_query_id':cb['id']})
             data=(cb or {}).get('data','')
             text=((msg or {}).get('text') or '').strip()
-            if data=='buy' or text.split('@')[0].lower()=='/subscribe' and WHOP_API_KEY:
+            if data=='contact' or text.split('@')[0].lower()=='/contact':
+                contact(who_id)
+            elif data=='buy' or text.split('@')[0].lower()=='/subscribe' and WHOP_API_KEY:
                 send_buy(who_id)
             elif data=='request:subscription' and not WHOP_CHECKOUT_URL:
                 send(who_id,subscribe_now(who_id),None)
             elif text and not text.startswith('/'):
                 w,_=_who(who_id)
                 _notify_admins(f'✉️ رسالة من عميل (اشتراكه منتهي)\nالعميل: {w}\nالـ ID: {who_id}\n\n{text[:1500]}\n\nللرد: /r {who_id} الرسالة')
-                send(who_id,ended_short(state)+'\nاضغط «اشترك الآن» لإتمام الاشتراك.',subscribe_kb())
+                send(who_id,ended_short(state)+'\nاضغط «اشترك الآن» لإتمام الاشتراك.',expired_kb())
             else:
-                send(who_id,ended_short(state),subscribe_kb())
+                send(who_id,ended_short(state),expired_kb())
             return
     if cb and cb.get('data')=='buy':
         call('answerCallbackQuery',{'callback_query_id':cb['id']})
@@ -698,7 +746,7 @@ def process(update):
         if cmd=='/subscribe' and WHOP_CHECKOUT_URL:
             send(uid,'💳 اضغط الزر التالي لإتمام الاشتراك والدفع بأمان عبر Whop.',subscribe_kb());return
         if cmd in ('/trial','/subscribe','/mine','/today','/account'):
-            r={'/trial':lambda:request_trial(uid),'/subscribe':lambda:subscribe_now(uid),
+            r={'/trial':lambda:'تجربتك المجانية مفعّلة تلقائيًا ✅','/subscribe':lambda:subscribe_now(uid),
                '/mine':lambda:mine(uid),'/today':lambda:mine_today(uid),'/account':lambda:account(uid)}[cmd]()
             if r is not None:send(uid,r,MAIN_MENU)
             return
@@ -788,7 +836,7 @@ def process(update):
             _notify_admins(f'✉️ رسالة من عميل\nالعميل: {who}\nالـ ID: {uid}\n\n{text[:1500]}\n\nللرد: /r {uid} الرسالة')
             send(uid,'✅ وصلت رسالتك إلى فريق الصفوة، وسنرد عليك في أقرب وقت.',MAIN_MENU)
             return
-        send(uid,f'أهلًا بك في الصفوة 👑\nقم بتفعيل التجربة المجانية حتى تحقيق {TRIAL_WINS} توصيات ناجحة، وبعدها يمكنك الاشتراك بباقات التوصيات.',MAIN_MENU)
+        send(uid,'أهلًا بك في الصفوة 👑\nستصلك التوصيات هنا فور صدورها. اختر من القائمة:',MAIN_MENU)
 
 def deliver_historical():
     """Send queued onboarding history to active accounts, with no new-trade implication."""
@@ -856,6 +904,8 @@ def main():
         call('setMyDescription',{'description':BOT_DESCRIPTION})
         call('setMyShortDescription',{'short_description':BOT_SHORT_DESCRIPTION})
     except Exception:LOG.exception('Cannot set bot commands')
+    try:backfill_trials()
+    except Exception:LOG.exception('backfill trials failed')
     offset=None
     last_check=0
     short_until=0        # لما تيليجرام يرجّع 502 في الانتظار الطويل، نسأل كل ثانية بدل ما نستنى
