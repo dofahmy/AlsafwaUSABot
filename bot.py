@@ -534,7 +534,6 @@ def start_trial_now(tid):
         start_trial(db,c)
         req=Request(telegram_id=tid,kind='trial',status='approved');req.decided_at=utcnow()
         db.add(req)
-        queue_recent_closed(db,tid,int(os.getenv('HISTORY_ON_ACTIVATION_COUNT','4')))
     set_expired_commands(tid,False)
     who,_=_who(tid)
     _notify_admins(f'🎁 تجربة مجانية اتفعّلت تلقائيًا\nالعميل: {who}\nالـ ID: {tid}')
@@ -546,6 +545,47 @@ WELCOME_TRIAL=(f'أهلًا بك في الصفوة 👑\n'
                '(التوصية الناجحة = وصلت للهدف الأول).')
 
 
+def sample_harvest():
+    """حصاد قصير للعميل الجديد: ٤ توصيات كسبانة + واحدة وقف خسارة، كل واحدة من يوم مختلف."""
+    from common import is_replay
+    with Session() as db:
+        sids=list(db.scalars(select(Event.signal_id).where(Event.kind=='open').order_by(Event.id.desc()).limit(300)).all())
+        seen,rows=set(),[]
+        for sid in sids:
+            if sid in seen:continue
+            seen.add(sid)
+            opened,last,pct=_status(db,sid)
+            if not opened or is_replay(opened.payload) or pct is None:continue
+            rows.append((sid.split(':')[0],sid.split(':')[1],last.kind,pct))
+    wins,days=[],set()
+    for pref in (('target2',),('target1','breakeven')):          # الهدف التاني الأول، وبعدين الأول
+        for d,sym,k,pct in rows:
+            if len(wins)>=4:break
+            if k in pref and d not in days:
+                wins.append((d,sym,k,pct));days.add(d)
+    loss=next(((d,sym,k,pct) for d,sym,k,pct in rows if k=='stop' and d not in days),None) or \
+         next(((d,sym,k,pct) for d,sym,k,pct in rows if k=='stop'),None)
+    picked=sorted(wins+([loss] if loss else []))
+    if not picked:return None
+    lines=[]
+    for d,sym,k,pct in picked:
+        try:dd=datetime.strptime(d,'%Y-%m-%d').strftime('%d/%m')
+        except Exception:dd=d
+        what={'target2':'✅ {s} ({d}) — الهدف الثاني','target1':'✅ {s} ({d}) — الهدف الأول',
+              'breakeven':'✅ {s} ({d}) — الهدف الأول','stop':'❌ {s} ({d}) — وقف خسارة'}[k]
+        lines.append(what.format(s=sym,d=dd)+f' ({pct:+.1f}%)')
+    return '📊 حصاد بعض توصيات بوت الصفوة للسوق الأمريكي\n\n'+'\n'.join(lines)
+
+
+def welcome_new(tid):
+    """أول دخول: الحصاد الأول، ورسالة تفعيل التجربة في الآخر علشان تبقى قدام العميل."""
+    try:
+        h=sample_harvest()
+        if h:send(tid,h)
+    except Exception:LOG.exception('sample harvest failed')
+    send(tid,WELCOME_TRIAL,MAIN_MENU)
+
+
 def backfill_trials():
     """مرة واحدة عند التشغيل: أي عميل موجود عمره ما بدأ التجربة ← تتفعّل له ونبلّغه."""
     with Session() as db:
@@ -555,7 +595,7 @@ def backfill_trials():
         try:
             if start_trial_now(tid):
                 n+=1
-                try:send(tid,WELCOME_TRIAL,MAIN_MENU)
+                try:welcome_new(tid)
                 except Exception:LOG.warning('trial welcome to %s failed',tid)
                 time.sleep(0.05)
         except Exception:LOG.exception('backfill trial %s failed',tid)
@@ -575,7 +615,6 @@ def auto_trial(tid,phone=''):
         start_trial(db,c)
         req=Request(telegram_id=tid,kind='trial',status='approved');req.decided_at=utcnow()
         db.add(req)
-        queue_recent_closed(db,tid,int(os.getenv('HISTORY_ON_ACTIVATION_COUNT','4')))
     who,_=_who(tid)
     _notify_admins(f'🎁 تم تفعيل تجربة مجانية تلقائيًا\nالعميل: {who}\nالـ ID: {tid}\nالرقم: +{phone}')
     return (f'🎉 تم تفعيل التجربة المجانية: ستصلك التوصيات حتى تحقيق {TRIAL_WINS} توصيات ناجحة '
@@ -695,7 +734,7 @@ def process(update):
     if who_id and (cb or (msg and msg['chat']['type']=='private')):
         ensure_user(who_id,((cb or msg).get('from') or {}).get('username',''))
         if start_trial_now(who_id):                         # أول دخول: التجربة بتتفعّل لوحدها
-            send(who_id,WELCOME_TRIAL,MAIN_MENU)
+            welcome_new(who_id)
             if msg and ((msg.get('text') or '').strip().split('@')[0].lower() in ('/start','')):
                 return
         state=expired_state(who_id)
@@ -839,7 +878,15 @@ def process(update):
         send(uid,'أهلًا بك في الصفوة 👑\nستصلك التوصيات هنا فور صدورها. اختر من القائمة:',MAIN_MENU)
 
 def deliver_historical():
-    """Send queued onboarding history to active accounts, with no new-trade implication."""
+    """الرسايل القديمة «توصية مغلقة سابقة» اتلغت: الحصاد القصير (sample_harvest) بقى بديلها.
+    أي حاجة لسه في الطابور بتتلغي من غير ما تتبعت."""
+    from sqlalchemy import update
+    with Session.begin() as db:
+        db.execute(update(HistoricalDelivery).where(HistoricalDelivery.status=='queued').values(status='skipped'))
+    return
+
+
+def _deliver_historical_old():
     with Session() as db:
         ids=list(db.scalars(select(HistoricalDelivery.id).where(
             HistoricalDelivery.status=='queued').order_by(HistoricalDelivery.id).limit(25)).all())
