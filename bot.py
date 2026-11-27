@@ -2,7 +2,7 @@
 import os, time, json, logging
 from datetime import datetime, timezone
 from sqlalchemy import select
-from common import (Session, Customer, Request, Event, Delivery, HistoricalDelivery, PremarketPost, queue_recent_closed,
+from common import (Session, CustomerInfo, BLOCK_MARKS, mark_blocked, unmark_blocked, blocked_ids, Customer, Request, Event, Delivery, HistoricalDelivery, PremarketPost, queue_recent_closed,
                     grant, active, utcnow, Credit, credit, eligible, start_trial, add_credits, has_purchased, TRIAL_WINS, PACKAGE_SIZE,
                     TrialPhone, CreditLedger)
 from telegram_api import call,send,send_photo,send_document,send_markup
@@ -100,7 +100,61 @@ BOT_DESCRIPTION="""👑 الصفوة | توصيات لحظية على الأسه
 # السطر اللي بيظهر في صفحة البوت (About) ولما حد يشارك البوت
 BOT_SHORT_DESCRIPTION="توصيات لحظية على الأسهم الأمريكية بأهداف ووقف خسارة واضح — جرّبها مجانًا حتى 5 توصيات ناجحة"   # يوزر حساب خدمة العملاء (اختياري)
 
+LANG_AR={'ar':'عربي','en':'إنجليزي','fr':'فرنساوي','de':'ألماني','es':'إسباني','tr':'تركي','fa':'فارسي',
+         'ru':'روسي','ur':'أردو','id':'إندونيسي','ms':'ملايو','it':'إيطالي','pt':'برتغالي','hi':'هندي'}
+_PROFILE_SEEN={}
+
+
+def save_profile(frm):
+    """بنحفظ الاسم واللغة والبريميوم من بيانات تيليجرام اللي بتيجي مع كل رسالة (لو اتغيرت بس)."""
+    if not frm or not frm.get('id') or frm.get('is_bot'):return
+    tid=frm['id']
+    key=(frm.get('first_name'),frm.get('last_name'),frm.get('language_code'),frm.get('is_premium'))
+    if _PROFILE_SEEN.get(tid)==key:return
+    try:
+        with Session.begin() as db:
+            ci=db.get(CustomerInfo,tid)
+            if not ci:ci=CustomerInfo(telegram_id=tid);db.add(ci)
+            ci.first_name=(frm.get('first_name') or '')[:128] or None
+            ci.last_name=(frm.get('last_name') or '')[:128] or None
+            if frm.get('language_code'):ci.lang=frm['language_code'][:16]
+            ci.premium=bool(frm.get('is_premium'))
+            ci.updated_at=utcnow()
+        _PROFILE_SEEN[tid]=key
+    except Exception:LOG.exception('save_profile %s',tid)
+
+
+def _fill_from_getchat(tid):
+    """للعملاء القدام: نجيب الاسم والـ Bio مرة واحدة من getChat."""
+    try:ch=call('getChat',{'chat_id':tid})
+    except Exception:return None
+    try:
+        with Session.begin() as db:
+            ci=db.get(CustomerInfo,tid)
+            if not ci:ci=CustomerInfo(telegram_id=tid);db.add(ci)
+            ci.first_name=(ch.get('first_name') or '')[:128] or None
+            ci.last_name=(ch.get('last_name') or '')[:128] or None
+            ci.bio=(ch.get('bio') or '')[:256] or None
+            ci.updated_at=utcnow()
+            if ch.get('username'):
+                c=db.get(Customer,tid)
+                if c and c.username!=ch['username']:c.username=ch['username']
+    except Exception:LOG.exception('getChat save %s',tid)
+    return ch
+
+
+def info(tid):
+    with Session() as db:
+        ci=db.get(CustomerInfo,tid)
+        c=db.get(Customer,tid)
+        d={'name':' '.join(x for x in ((ci.first_name if ci else None),(ci.last_name if ci else None)) if x),
+           'lang':ci.lang if ci else None,'premium':ci.premium if ci else None,'phone':ci.phone if ci else None,
+           'bio':ci.bio if ci else None,'username':(c.username if c else '') or ''}
+    return d
+
+
 def ensure_user(tid,username=''):
+    unmark_blocked(tid)                 # كلّم البوت تاني ← يرجع يستلم
     with Session.begin() as db:
         c=db.get(Customer,tid)
         if not c: db.add(Customer(telegram_id=tid,username=username))
@@ -241,7 +295,7 @@ def check_expiries():
             except Exception:LOG.warning('expiry notice to %s failed',tid)
         set_expired_commands(tid,True)
         who,_=_who(tid)
-        _notify_admins(f'⏰ {"انتهى رصيد" if paid else "انتهت تجربة"} العميل {who} (ID: {tid})')
+        _notify_admins(f'⏰ {"انتهى رصيد" if paid else "انتهت تجربة"} العميل {who} (ID: {tid})',tid=tid)
 
 
 def send_customers(admin):
@@ -287,8 +341,9 @@ def reset_customer(tid):
         for model,col in ((Credit,Credit.telegram_id),(CreditLedger,CreditLedger.telegram_id),
                           (TrialPhone,TrialPhone.telegram_id),(Request,Request.telegram_id),
                           (Delivery,Delivery.telegram_id),(HistoricalDelivery,HistoricalDelivery.telegram_id),
-                          (Customer,Customer.telegram_id)):
+                          (CustomerInfo,CustomerInfo.telegram_id),(Customer,Customer.telegram_id)):
             db.execute(delete(model).where(col==tid))
+    _PROFILE_SEEN.pop(tid,None)
     set_expired_commands(tid,False)
     return found
 
@@ -455,16 +510,41 @@ def show_signal(tid,sid):
 
 
 def _who(tid):
-    with Session() as db:
-        c=db.get(Customer,tid)
-        u=(c.username or '') if c else ''
-    return (f'@{u}' if u else 'ليس له اسم مستخدم'), u
+    """اسم العميل للإدارة: الاسم + اسم المستخدم لو موجود + لغة التطبيق."""
+    d=info(tid)
+    if not d['name']:
+        _fill_from_getchat(tid);d=info(tid)
+    u=d['username']
+    parts=[d['name'] or 'بدون اسم']
+    parts.append(f'@{u}' if u else '(بدون اسم مستخدم)')
+    extra=[]
+    if d['lang']:extra.append('لغة التطبيق: '+LANG_AR.get(d['lang'].split('-')[0],d['lang']))
+    if d['premium']:extra.append('⭐ بريميوم')
+    if d['phone']:extra.append(f'📱 +{d["phone"]}')
+    label=' '.join(parts)+(' — '+'، '.join(extra) if extra else '')
+    return label,u
 
 
-def _notify_admins(text,keyboard=None):
+def _utf16(s):
+    return len(s.encode('utf-16-le'))//2
+
+
+def _notify_admins(text,keyboard=None,tid=None):
+    """لو فيه tid: اسم العميل في الرسالة بيبقى لينك يفتح حسابه، وزرار واتساب لو رقمه معانا."""
+    ents=None
+    if tid:
+        d=info(tid)
+        name=d['name']
+        i=text.find(name) if name else -1
+        if i>=0:
+            ents=[{'type':'text_mention','offset':_utf16(text[:i]),'length':_utf16(name),'user':{'id':int(tid)}}]
+        if d['phone']:
+            keyboard=(keyboard or [])+[[{'text':'💬 واتساب العميل','url':f'https://wa.me/{d["phone"]}'}]]
     for admin in ADMINS:
-        try:send(admin,text,keyboard)
-        except Exception:LOG.exception('Cannot notify admin')
+        try:send(admin,text,keyboard,ents)
+        except Exception:
+            try:send(admin,text,keyboard)                     # لو اللينك اترفض نبعت من غيره
+            except Exception:LOG.exception('Cannot notify admin')
 
 
 PHONE_KB={'keyboard':[[{'text':'📱 مشاركة رقمي','request_contact':True}]],'resize_keyboard':True,'one_time_keyboard':True}
@@ -490,6 +570,18 @@ def on_contact(msg):
     if len(phone)<8:
         send_markup(uid,'⚠️ تعذّر قراءة الرقم، حاول مرة أخرى.',PHONE_KB);return
     with Session.begin() as db:
+        ci=db.get(CustomerInfo,uid)
+        if not ci:ci=CustomerInfo(telegram_id=uid);db.add(ci)
+        ci.phone=phone;ci.updated_at=utcnow()
+        c=db.get(Customer,uid)
+        contact_only=bool(c and (c.trial_used or eligible(db,uid)))
+    if contact_only:                     # الرقم للتواصل بس (التجربة بتتفعّل لوحدها من غير رقم)
+        send_markup(uid,'✅ شكرًا لك، سيتواصل معك فريق الصفوة على هذا الرقم.',NO_KB)
+        send(uid,'اختر من القائمة:',MAIN_MENU)
+        w,_=_who(uid)
+        _notify_admins(f'📱 عميل شارك رقمه للتواصل\nالعميل: {w}\nالـ ID: {uid}\nالرقم: +{phone}',tid=uid)
+        return
+    with Session.begin() as db:
         owner=db.get(TrialPhone,phone)
         if owner and owner.telegram_id!=uid:
             used=True
@@ -500,7 +592,7 @@ def on_contact(msg):
         send_markup(uid,'🙏 هذا الرقم استُخدم في تجربة مجانية من قبل.',NO_KB)
         send(uid,'يمكنك الاشتراك بباقات التوصيات من «💳 اشترك الآن».',subscribe_kb())
         w,_=_who(uid)
-        _notify_admins(f'🚫 محاولة تجربة برقم مستخدم قبل كده\nالعميل: {w} (ID: {uid})\nالرقم: +{phone}')
+        _notify_admins(f'🚫 محاولة تجربة برقم مستخدم قبل كده\nالعميل: {w} (ID: {uid})\nالرقم: +{phone}',tid=uid)
         return
     send_markup(uid,'✅ تم التحقق من رقمك.',NO_KB)
     send(uid,auto_trial(uid,phone),MAIN_MENU)
@@ -536,7 +628,7 @@ def start_trial_now(tid):
         db.add(req)
     set_expired_commands(tid,False)
     who,_=_who(tid)
-    _notify_admins(f'🎁 تجربة مجانية اتفعّلت تلقائيًا\nالعميل: {who}\nالـ ID: {tid}')
+    _notify_admins(f'🎁 تجربة مجانية اتفعّلت تلقائيًا\nالعميل: {who}\nالـ ID: {tid}',tid=tid)
     return True
 
 
@@ -616,7 +708,7 @@ def auto_trial(tid,phone=''):
         req=Request(telegram_id=tid,kind='trial',status='approved');req.decided_at=utcnow()
         db.add(req)
     who,_=_who(tid)
-    _notify_admins(f'🎁 تم تفعيل تجربة مجانية تلقائيًا\nالعميل: {who}\nالـ ID: {tid}\nالرقم: +{phone}')
+    _notify_admins(f'🎁 تم تفعيل تجربة مجانية تلقائيًا\nالعميل: {who}\nالـ ID: {tid}\nالرقم: +{phone}',tid=tid)
     return (f'🎉 تم تفعيل التجربة المجانية: ستصلك التوصيات حتى تحقيق {TRIAL_WINS} توصيات ناجحة '
             '(التوصية الناجحة = وصلت للهدف الأول).\n'
             'ستصلك التوصيات الجديدة هنا فور صدورها.\n'
@@ -636,15 +728,19 @@ def subscribe_now(tid):
     kb=[[{'text':'✅ تفعيل الاشتراك','callback_data':f'approve:{rid}'},{'text':'❌ رفض','callback_data':f'reject:{rid}'}]]
     if u:kb.insert(0,[{'text':'💬 تواصل مع العميل','url':f'https://t.me/{u}'}])
     if not ADMINS:LOG.error('ADMIN_TELEGRAM_IDS فارغ — لن تصل طلبات الاشتراك لأحد')
+    has_phone=bool(info(tid)['phone'])
     _notify_admins(f'💳 {"تذكير: " if again else ""}طلب اشتراك وتواصل\nالعميل: {who}\nالـ ID: {tid}\nالطلب: #{rid}'
-                   + ('' if u else '\n⚠️ العميل ليس له اسم مستخدم، فلا يمكن التواصل معه عبر رابط. يمكن الرد عليه من البوت بأمر /r.'),kb)
+                   + ('' if u or has_phone else '\nℹ️ ليس له اسم مستخدم: اضغطي على اسمه لفتح حسابه، أو رُدّي عليه بأمر /r.'),kb,tid=tid)
     if again:
-        return 'وصلنا طلبك من قبل ✅ وتم تذكير الفريق، وسنتواصل معك في أقرب وقت.'
-    msg=('✅ وصل طلب الاشتراك، وسيتواصل معك فريق الصفوة هنا على تيليجرام في أقرب وقت لتوضيح تفاصيل الاشتراك والدفع.\n'
-         'من فضلك لا ترسل بيانات بطاقتك داخل تليجرام.')
-    if not u:
-        msg+='\n\n📌 حسابك ليس له اسم مستخدم، ولكي نتمكن من التواصل معك: أضف اسم مستخدم من إعدادات تيليجرام، أو أرسل هنا رقم واتساب للتواصل.'
-    return msg
+        msg='وصلنا طلبك من قبل ✅ وتم تذكير الفريق، وسنتواصل معك في أقرب وقت.'
+    else:
+        msg=('✅ وصل طلب الاشتراك، وسيتواصل معك فريق الصفوة هنا على تيليجرام في أقرب وقت لتوضيح تفاصيل الاشتراك والدفع.\n'
+             'من فضلك لا ترسل بيانات بطاقتك داخل تليجرام.')
+    if has_phone:
+        return msg
+    # زرار مشاركة الرقم (اختياري) تحت خانة الكتابة
+    send_markup(tid,msg+'\n\n📱 إذا رغبت في التواصل معك على واتساب، اضغط زر «📱 مشاركة رقمي» بالأسفل (اختياري).',PHONE_KB)
+    return None
 
 
 def submit_request(tid,kind):
@@ -731,6 +827,7 @@ def process(update):
     cb=update.get('callback_query')
     # العميل اللي تجربته أو اشتراكه خلص: كل حاجة بترد بزرار خدمة العملاء بس
     who_id=(cb or {}).get('from',{}).get('id') or ((msg or {}).get('from') or {}).get('id')
+    save_profile((cb or {}).get('from') or ((msg or {}).get('from') if msg and msg.get('chat',{}).get('type')=='private' else None))
     if who_id and (cb or (msg and msg['chat']['type']=='private')):
         ensure_user(who_id,((cb or msg).get('from') or {}).get('username',''))
         if start_trial_now(who_id):                         # أول دخول: التجربة بتتفعّل لوحدها
@@ -747,10 +844,11 @@ def process(update):
             elif data=='buy' or text.split('@')[0].lower()=='/subscribe' and WHOP_API_KEY:
                 send_buy(who_id)
             elif data=='request:subscription' and not WHOP_CHECKOUT_URL:
-                send(who_id,subscribe_now(who_id),None)
+                r=subscribe_now(who_id)
+                if r:send(who_id,r,None)
             elif text and not text.startswith('/'):
                 w,_=_who(who_id)
-                _notify_admins(f'✉️ رسالة من عميل (اشتراكه منتهي)\nالعميل: {w}\nالـ ID: {who_id}\n\n{text[:1500]}\n\nللرد: /r {who_id} الرسالة')
+                _notify_admins(f'✉️ رسالة من عميل (اشتراكه منتهي)\nالعميل: {w}\nالـ ID: {who_id}\n\n{text[:1500]}\n\nللرد: /r {who_id} الرسالة',tid=who_id)
                 send(who_id,ended_short(state)+'\nاضغط «اشترك الآن» لإتمام الاشتراك.',expired_kb())
             else:
                 send(who_id,ended_short(state),expired_kb())
@@ -847,6 +945,25 @@ def process(update):
                     for d in ds:
                         if d.status!='sent':lines.append(f'  {d.telegram_id}: {d.status} {(d.error or "")[:120]}')
             send(uid,'\n'.join(lines)[:4000]);return
+        # الإدارة: /who <ID> ← بيانات العميل
+        if uid in ADMINS and cmd=='/who':
+            p=text.split()
+            if len(p)!=2 or not p[1].isdigit():
+                send(uid,'الصيغة: /who <ID العميل>');return
+            t=int(p[1]);_fill_from_getchat(t);d=info(t)
+            lines=[f'👤 العميل {t}',f'الاسم: {d["name"] or "—"}',f'اسم المستخدم: {"@"+d["username"] if d["username"] else "—"}',
+                   f'لغة التطبيق: {LANG_AR.get((d["lang"] or "").split("-")[0],d["lang"] or "—")}',
+                   f'بريميوم: {"نعم" if d["premium"] else "لا"}',f'الرقم: {"+"+d["phone"] if d["phone"] else "لم يشاركه"}',
+                   f'النبذة: {d["bio"] or "—"}']
+            body='\n'.join(lines)
+            ents=None
+            if d['name']:
+                i=body.find(d['name'])
+                ents=[{'type':'text_mention','offset':_utf16(body[:i]),'length':_utf16(d['name']),'user':{'id':t}}]
+            kb=[[{'text':'💬 واتساب','url':f'https://wa.me/{d["phone"]}'}]] if d['phone'] else None
+            try:send(uid,body,kb,ents)
+            except Exception:send(uid,body,kb)
+            return
         # الإدارة: /reset <ID> ← حذف العميل بالكامل (بعد تأكيد)
         if uid in ADMINS and cmd=='/reset':
             p=text.split()
@@ -872,7 +989,7 @@ def process(update):
         # أي رسالة من عميل (غير /start) بتتحول للإدارة، زي رقم الواتساب
         if text and not text.startswith('/') and uid not in ADMINS:
             who,_=_who(uid)
-            _notify_admins(f'✉️ رسالة من عميل\nالعميل: {who}\nالـ ID: {uid}\n\n{text[:1500]}\n\nللرد: /r {uid} الرسالة')
+            _notify_admins(f'✉️ رسالة من عميل\nالعميل: {who}\nالـ ID: {uid}\n\n{text[:1500]}\n\nللرد: /r {uid} الرسالة',tid=uid)
             send(uid,'✅ وصلت رسالتك إلى فريق الصفوة، وسنرد عليك في أقرب وقت.',MAIN_MENU)
             return
         send(uid,'أهلًا بك في الصفوة 👑\nستصلك التوصيات هنا فور صدورها. اختر من القائمة:',MAIN_MENU)
@@ -907,7 +1024,11 @@ def _deliver_historical_old():
             time.sleep(.07)
         except Exception as exc:
             err=str(exc)[:300]
-            LOG.warning('historical deliver %s failed: %s',hid,err[:150])
+            if any(m in err for m in BLOCK_MARKS):
+                mark_blocked(target)
+                LOG.info('customer %s blocked the bot; stopped sending',target)
+            else:
+                LOG.warning('historical deliver %s failed: %s',hid,err[:150])
             if any(x in err for x in (' 403 ',' 400 ','blocked','chat not found','deactivated')):
                 with Session.begin() as db:
                     db.get(HistoricalDelivery,hid).status='failed'
@@ -920,7 +1041,7 @@ def deliver():
     for did in ids:
         with Session() as db:
             d=db.get(Delivery,did);ev=db.get(Event,d.event_id);c=db.get(Customer,d.telegram_id)
-            if not c:
+            if not c or d.telegram_id in blocked_ids(db):
                 with Session.begin() as write:
                     row=write.get(Delivery,did);row.status='skipped'
                 continue
@@ -932,7 +1053,11 @@ def deliver():
             time.sleep(.07)
         except Exception as e:
             err=str(e)[:300]
-            LOG.warning('deliver %s to %s: %s',did,d.telegram_id,err[:150])
+            if any(m in err for m in BLOCK_MARKS):
+                mark_blocked(d.telegram_id)
+                LOG.info('customer %s blocked the bot; stopped sending',d.telegram_id)
+            else:
+                LOG.warning('deliver %s to %s: %s',did,d.telegram_id,err[:150])
             # عميل حاظر البوت أو المحادثة مش موجودة ← نهائي، علشان ما يوقفش الطابور لباقي العملاء
             permanent=any(x in err for x in (' 403 ',' 400 ','blocked','chat not found','deactivated'))
             with Session.begin() as write:
@@ -969,7 +1094,8 @@ def main():
             updates=call('getUpdates',{'offset':offset,'timeout':0 if short else 10,
                                        'allowed_updates':['message','callback_query']},timeout=8 if short else 20)
             if fails:
-                LOG.warning('Telegram polling back after %s failures',fails);fails=0
+                if fails>=3: LOG.warning('Telegram polling back after %s failures',fails)
+                fails=0
             for u in updates:
                 offset=u['update_id']+1
                 try:process(u)
@@ -980,7 +1106,8 @@ def main():
             msg=str(e)[:160]
             if any(c in msg for c in (' 502 ',' 503 ',' 504 ','timed out','Timeout','Connection')):
                 short_until=time.time()+600          # ١٠ دقايق انتظار قصير
-            if fails==1 or fails%30==0:
+            # انقطاع لحظة بيرجع في المحاولة اللي بعدها: ما نكتبوش. نكتب لو اتكرر ٣ مرات ورا بعض
+            if fails==3 or fails%30==0:
                 LOG.warning('Polling error (%s): %s',fails,msg)
             time.sleep(1 if fails<5 else 3)
 if __name__=='__main__': main()

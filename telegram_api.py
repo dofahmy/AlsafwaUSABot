@@ -11,8 +11,9 @@ def call(method, payload=None, timeout=30):
     if not data.get('ok'): raise RuntimeError(str(data)[:250])
     return data['result']
 
-def send(chat_id,text,keyboard=None):
+def send(chat_id,text,keyboard=None,entities=None):
     data={'chat_id':chat_id,'text':text,'disable_web_page_preview':True}
+    if entities: data['entities']=entities
     if keyboard: data['reply_markup']={'inline_keyboard':keyboard}
     return call('sendMessage',data)
 

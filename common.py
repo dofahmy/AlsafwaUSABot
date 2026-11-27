@@ -49,6 +49,38 @@ class Delivery(Base):
     sent_at=Column(DateTime(timezone=True))
     error=Column(Text)
 
+class CustomerInfo(Base):
+    """بيانات العميل من تيليجرام: الاسم واللغة والبريميوم، والرقم لو شاركه بنفسه."""
+    __tablename__='customer_info'
+    telegram_id=Column(BigInteger,primary_key=True)
+    first_name=Column(String(128))
+    last_name=Column(String(128))
+    lang=Column(String(16))
+    premium=Column(Boolean)
+    phone=Column(String(32))
+    bio=Column(String(256))
+    updated_at=Column(DateTime(timezone=True),default=utcnow)
+
+class BlockedCustomer(Base):
+    """عميل حظر البوت: ما نحطلوش رسايل لحد ما يرجع يكلّم البوت."""
+    __tablename__='blocked_customers'
+    telegram_id=Column(BigInteger,primary_key=True)
+    blocked_at=Column(DateTime(timezone=True),default=utcnow)
+
+BLOCK_MARKS=('blocked by the user','user is deactivated','chat not found','bot was kicked')
+
+def blocked_ids(db):
+    return set(db.scalars(select(BlockedCustomer.telegram_id)).all())
+
+def mark_blocked(tid):
+    with Session.begin() as db:
+        if not db.get(BlockedCustomer,tid): db.add(BlockedCustomer(telegram_id=tid))
+
+def unmark_blocked(tid):
+    with Session.begin() as db:
+        row=db.get(BlockedCustomer,tid)
+        if row: db.delete(row)
+
 class HistoricalDelivery(Base):
     """Durable, per-customer queue for already-closed recommendations sent after activation."""
     __tablename__='historical_deliveries'
